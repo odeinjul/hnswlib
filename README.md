@@ -56,7 +56,11 @@ Note that inner product is not an actual metric. An element can be closer to som
 For other spaces use the nmslib library https://github.com/nmslib/nmslib. 
 
 #### API description
-* `hnswlib.Index(space, dim)` creates a non-initialized index an HNSW in space `space` with integer dimension `dim`.
+* `hnswlib.Index(space, dim, dtype = 'float32')` creates a non-initialized HNSW index in space `space` with integer dimension `dim`.
+    * `dtype` can be `'float32'`, `'uint8'`, or `'int8'`.
+    * Integer dtypes are supported only for `space='l2'`.
+    * The default `'float32'` path keeps the legacy index binary layout and does not write extra metadata by default.
+    * Native integer indexes store one byte per vector component and require the sidecar file `<index path>.hnswmeta.json` when loading.
 
 `hnswlib.Index` methods:
 * `init_index(max_elements, M = 16, ef_construction = 200, random_seed = 100, allow_replace_deleted = False)` initializes the index from with no elements. 
@@ -71,6 +75,7 @@ For other spaces use the nmslib library https://github.com/nmslib/nmslib.
       - If index already has the elements with the same labels, their features will be updated. Note that update procedure is slower than insertion of a new element, but more memory- and query-efficient.
     * `replace_deleted` replaces deleted elements. Note it allows to save memory.
       - to use it `init_index` should be called with `allow_replace_deleted=True`
+    * For integer indexes, `data` must have the exact NumPy dtype selected by the index. No implicit float-to-integer conversion is performed.
     * Thread-safe with other `add_items` calls, but not with `knn_query`.
     
 * `mark_deleted(label)`  - marks the element as deleted, so it will be omitted from search results. Throws an exception if it is already deleted.
@@ -86,13 +91,16 @@ For other spaces use the nmslib library https://github.com/nmslib/nmslib.
     * `data` (shape:`N*dim`). Returns a numpy array of (shape:`N*k`).
     * `num_threads` sets the number of cpu threads to use (-1 means use default).
     * `filter` filters elements by its labels, returns elements with allowed ids. Note that search with a filter works slow in python in multithreaded mode. It is recommended to set `num_threads=1`
+    * For integer indexes, `data` must have the exact NumPy dtype selected by the index. Distances are still returned as `float32`.
     * Thread-safe with other `knn_query` calls, but not with `add_items`.
     
 * `load_index(path_to_index, max_elements = 0, allow_replace_deleted = False)` loads the index from persistence to the uninitialized index.
     * `max_elements`(optional) resets the maximum number of elements in the structure.
     * `allow_replace_deleted` specifies whether the index being loaded has enabled replacing of deleted elements.
+    * Integer indexes require `<path_to_index>.hnswmeta.json`. Loading an integer index without this metadata is rejected because `int8` and `uint8` cannot be distinguished from the binary payload alone.
       
 * `save_index(path_to_index)` saves the index from persistence.
+    * For `dtype='uint8'` and `dtype='int8'`, this also writes `<path_to_index>.hnswmeta.json`.
 
 * `set_num_threads(num_threads)` set the default number of cpu threads used during data insertion/querying.
   
@@ -109,6 +117,8 @@ Read-only properties of `hnswlib.Index` class:
 * `space` - name of the space (can be one of "l2", "ip", or "cosine"). 
 
 * `dim`   - dimensionality of the space. 
+
+* `dtype` - vector storage dtype (`"float32"`, `"uint8"`, or `"int8"`).
 
 * `M` - parameter that defines the maximum number of outgoing connections in the graph. 
 
@@ -172,6 +182,44 @@ print(f"Index construction: M={p_copy.M}, ef_construction={p_copy.ef_constructio
 print(f"Index size is {p_copy.element_count} and index capacity is {p_copy.max_elements}")
 print(f"Search speed/quality trade-off parameter: ef={p_copy.ef}")
 ```
+
+Native `uint8` and `int8` L2 indexes:
+```python
+import hnswlib
+import numpy as np
+
+dim = 128
+num_elements = 10000
+
+data = np.random.randint(0, 256, size=(num_elements, dim), dtype=np.uint8)
+queries = data[:10]
+
+index = hnswlib.Index(space='l2', dim=dim, dtype='uint8')
+index.init_index(max_elements=num_elements, ef_construction=200, M=16)
+index.add_items(data, np.arange(num_elements))
+index.set_ef(50)
+
+labels, distances = index.knn_query(queries, k=10)
+index.save_index("uint8_l2.bin")  # also writes uint8_l2.bin.hnswmeta.json
+
+loaded = hnswlib.Index(space='l2', dim=dim, dtype='uint8')
+loaded.load_index("uint8_l2.bin")
+```
+
+The saved HNSW binary keeps the existing row layout. For integer indexes the vector payload is `dim` bytes per row, and the sidecar metadata records the dtype and layout fields required for safe reload. Keep the `.hnswmeta.json` file with the index file.
+
+A BigANN-style `.u8bin` file can be built directly with:
+```bash
+python examples/python/build_bigann_u8.py base.100K.u8bin bigann_100k_uint8.bin --max-vectors 100000
+```
+
+An existing BigANN HNSW index can be converted or tagged for native `uint8` loading with:
+```bash
+python examples/python/convert_bigann_index_to_u8.py index_m_32_ef_500 base.u8bin index_m_32_ef_500_uint8
+python examples/python/convert_bigann_index_to_u8.py index_m_32_ef_500_initial_8m base_permuted.fbin index_m_32_ef_500_initial_8m_uint8
+```
+
+The converter validates sampled rows against the supplied `.u8bin` or `.fbin` base by label. If the source stores float32 vectors, it verifies the payload against the base vectors, rewrites the level-0 vector payload as original `uint8` bytes, and copies the graph links unchanged. If the source already stores `uint8` vectors, it copies the binary index and writes the required `.hnswmeta.json` sidecar.
 
 An example with updates after serialization/deserialization:
 ```python
