@@ -6,6 +6,11 @@ import numpy as np
 
 import hnswlib
 
+try:
+    from tqdm.auto import tqdm
+except ImportError:
+    tqdm = None
+
 
 def read_u8bin(path, max_vectors=None):
     with open(path, "rb") as input_file:
@@ -25,6 +30,28 @@ def read_u8bin(path, max_vectors=None):
         return data.reshape(num_vectors, dim)
 
 
+def batch_ranges(total, batch_size):
+    if batch_size <= 0:
+        raise ValueError("batch_size must be > 0")
+    for start in range(0, total, batch_size):
+        yield start, min(start + batch_size, total)
+
+
+def add_items_with_progress(index, data, labels, num_threads, batch_size, show_progress):
+    progress = None
+    if show_progress and tqdm is not None:
+        progress = tqdm(total=data.shape[0], unit="vectors", desc="Building HNSW index")
+
+    try:
+        for start, end in batch_ranges(data.shape[0], batch_size):
+            index.add_items(data[start:end], labels[start:end], num_threads=num_threads)
+            if progress is not None:
+                progress.update(end - start)
+    finally:
+        if progress is not None:
+            progress.close()
+
+
 def main():
     parser = argparse.ArgumentParser(description="Build a native uint8 HNSW index from a BigANN .u8bin file.")
     parser.add_argument("input", help="Path to a BigANN-style .u8bin file")
@@ -34,7 +61,15 @@ def main():
     parser.add_argument("--ef-construction", type=int, default=500)
     parser.add_argument("--ef", type=int, default=100)
     parser.add_argument("--threads", type=int, default=-1)
+    parser.add_argument("--batch-size", type=int, default=100000, help="Rows per add_items call")
+    parser.add_argument(
+        "--no-progress",
+        action="store_true",
+        help="Disable the tqdm progress bar while adding vectors",
+    )
     args = parser.parse_args()
+    if args.batch_size <= 0:
+        parser.error("--batch-size must be > 0")
 
     data = read_u8bin(args.input, args.max_vectors)
     labels = np.arange(data.shape[0], dtype=np.uint64)
@@ -44,7 +79,14 @@ def main():
     index.set_ef(args.ef)
 
     start = time.time()
-    index.add_items(data, labels, num_threads=args.threads)
+    add_items_with_progress(
+        index,
+        data,
+        labels,
+        num_threads=args.threads,
+        batch_size=args.batch_size,
+        show_progress=not args.no_progress,
+    )
     build_seconds = time.time() - start
 
     index.save_index(args.output)
