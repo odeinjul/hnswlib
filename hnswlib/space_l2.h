@@ -19,6 +19,123 @@ L2Sqr(const void *pVect1v, const void *pVect2v, const void *qty_ptr) {
     return (res);
 }
 
+static float
+L2SqrUInt8(const void *pVect1v, const void *pVect2v, const void *qty_ptr) {
+    const unsigned char *pVect1 = (const unsigned char *) pVect1v;
+    const unsigned char *pVect2 = (const unsigned char *) pVect2v;
+    size_t qty = *((size_t *) qty_ptr);
+
+    float res = 0;
+    for (size_t i = 0; i < qty; i++) {
+        float t = (float) pVect1[i] - (float) pVect2[i];
+        res += t * t;
+    }
+    return res;
+}
+
+static float
+L2SqrInt8(const void *pVect1v, const void *pVect2v, const void *qty_ptr) {
+    const signed char *pVect1 = (const signed char *) pVect1v;
+    const signed char *pVect2 = (const signed char *) pVect2v;
+    size_t qty = *((size_t *) qty_ptr);
+
+    float res = 0;
+    for (size_t i = 0; i < qty; i++) {
+        float t = (float) pVect1[i] - (float) pVect2[i];
+        res += t * t;
+    }
+    return res;
+}
+
+#if defined(USE_SSE)
+static int
+HorizontalSum4x32(__m128i v) {
+    int PORTABLE_ALIGN32 tmp[4];
+    _mm_store_si128((__m128i *) tmp, v);
+    return tmp[0] + tmp[1] + tmp[2] + tmp[3];
+}
+
+static float
+L2SqrUInt8SIMD16Ext(const void *pVect1v, const void *pVect2v, const void *qty_ptr) {
+    const unsigned char *pVect1 = (const unsigned char *) pVect1v;
+    const unsigned char *pVect2 = (const unsigned char *) pVect2v;
+    size_t qty = *((size_t *) qty_ptr);
+    size_t qty16 = qty >> 4;
+    const unsigned char *pEnd1 = pVect1 + (qty16 << 4);
+
+    __m128i sum = _mm_setzero_si128();
+    const __m128i zero = _mm_setzero_si128();
+
+    while (pVect1 < pEnd1) {
+        __m128i a = _mm_loadu_si128((const __m128i *) pVect1);
+        __m128i b = _mm_loadu_si128((const __m128i *) pVect2);
+
+        __m128i diff_lo = _mm_sub_epi16(_mm_unpacklo_epi8(a, zero), _mm_unpacklo_epi8(b, zero));
+        __m128i diff_hi = _mm_sub_epi16(_mm_unpackhi_epi8(a, zero), _mm_unpackhi_epi8(b, zero));
+        sum = _mm_add_epi32(sum, _mm_madd_epi16(diff_lo, diff_lo));
+        sum = _mm_add_epi32(sum, _mm_madd_epi16(diff_hi, diff_hi));
+
+        pVect1 += 16;
+        pVect2 += 16;
+    }
+
+    return (float) HorizontalSum4x32(sum);
+}
+
+static float
+L2SqrUInt8SIMD16ExtResiduals(const void *pVect1v, const void *pVect2v, const void *qty_ptr) {
+    size_t qty = *((size_t *) qty_ptr);
+    size_t qty16 = qty >> 4 << 4;
+    float res = L2SqrUInt8SIMD16Ext(pVect1v, pVect2v, &qty16);
+    const unsigned char *pVect1 = (const unsigned char *) pVect1v + qty16;
+    const unsigned char *pVect2 = (const unsigned char *) pVect2v + qty16;
+
+    size_t qty_left = qty - qty16;
+    return res + L2SqrUInt8(pVect1, pVect2, &qty_left);
+}
+
+static float
+L2SqrInt8SIMD16Ext(const void *pVect1v, const void *pVect2v, const void *qty_ptr) {
+    const signed char *pVect1 = (const signed char *) pVect1v;
+    const signed char *pVect2 = (const signed char *) pVect2v;
+    size_t qty = *((size_t *) qty_ptr);
+    size_t qty16 = qty >> 4;
+    const signed char *pEnd1 = pVect1 + (qty16 << 4);
+
+    __m128i sum = _mm_setzero_si128();
+    const __m128i zero = _mm_setzero_si128();
+
+    while (pVect1 < pEnd1) {
+        __m128i a = _mm_loadu_si128((const __m128i *) pVect1);
+        __m128i b = _mm_loadu_si128((const __m128i *) pVect2);
+        __m128i sign_a = _mm_cmpgt_epi8(zero, a);
+        __m128i sign_b = _mm_cmpgt_epi8(zero, b);
+
+        __m128i diff_lo = _mm_sub_epi16(_mm_unpacklo_epi8(a, sign_a), _mm_unpacklo_epi8(b, sign_b));
+        __m128i diff_hi = _mm_sub_epi16(_mm_unpackhi_epi8(a, sign_a), _mm_unpackhi_epi8(b, sign_b));
+        sum = _mm_add_epi32(sum, _mm_madd_epi16(diff_lo, diff_lo));
+        sum = _mm_add_epi32(sum, _mm_madd_epi16(diff_hi, diff_hi));
+
+        pVect1 += 16;
+        pVect2 += 16;
+    }
+
+    return (float) HorizontalSum4x32(sum);
+}
+
+static float
+L2SqrInt8SIMD16ExtResiduals(const void *pVect1v, const void *pVect2v, const void *qty_ptr) {
+    size_t qty = *((size_t *) qty_ptr);
+    size_t qty16 = qty >> 4 << 4;
+    float res = L2SqrInt8SIMD16Ext(pVect1v, pVect2v, &qty16);
+    const signed char *pVect1 = (const signed char *) pVect1v + qty16;
+    const signed char *pVect2 = (const signed char *) pVect2v + qty16;
+
+    size_t qty_left = qty - qty16;
+    return res + L2SqrInt8(pVect1, pVect2, &qty_left);
+}
+#endif
+
 #if defined(USE_AVX512)
 
 // Favor using AVX512 if available.
@@ -250,6 +367,72 @@ class L2Space : public SpaceInterface<float> {
     }
 
     ~L2Space() {}
+};
+
+class L2SpaceUInt8 : public SpaceInterface<float> {
+    DISTFUNC<float> fstdistfunc_;
+    size_t data_size_;
+    size_t dim_;
+
+ public:
+    L2SpaceUInt8(size_t dim) {
+        fstdistfunc_ = L2SqrUInt8;
+#if defined(USE_SSE)
+        if (dim % 16 == 0)
+            fstdistfunc_ = L2SqrUInt8SIMD16Ext;
+        else if (dim > 16)
+            fstdistfunc_ = L2SqrUInt8SIMD16ExtResiduals;
+#endif
+        dim_ = dim;
+        data_size_ = dim * sizeof(unsigned char);
+    }
+
+    size_t get_data_size() {
+        return data_size_;
+    }
+
+    DISTFUNC<float> get_dist_func() {
+        return fstdistfunc_;
+    }
+
+    void *get_dist_func_param() {
+        return &dim_;
+    }
+
+    ~L2SpaceUInt8() {}
+};
+
+class L2SpaceInt8 : public SpaceInterface<float> {
+    DISTFUNC<float> fstdistfunc_;
+    size_t data_size_;
+    size_t dim_;
+
+ public:
+    L2SpaceInt8(size_t dim) {
+        fstdistfunc_ = L2SqrInt8;
+#if defined(USE_SSE)
+        if (dim % 16 == 0)
+            fstdistfunc_ = L2SqrInt8SIMD16Ext;
+        else if (dim > 16)
+            fstdistfunc_ = L2SqrInt8SIMD16ExtResiduals;
+#endif
+        dim_ = dim;
+        data_size_ = dim * sizeof(signed char);
+    }
+
+    size_t get_data_size() {
+        return data_size_;
+    }
+
+    DISTFUNC<float> get_dist_func() {
+        return fstdistfunc_;
+    }
+
+    void *get_dist_func_param() {
+        return &dim_;
+    }
+
+    ~L2SpaceInt8() {}
 };
 
 static int

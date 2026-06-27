@@ -8,6 +8,12 @@
 #include <atomic>
 #include <stdlib.h>
 #include <assert.h>
+#include <cstdint>
+#include <fstream>
+#include <memory>
+#include <regex>
+#include <sstream>
+#include <type_traits>
 
 namespace py = pybind11;
 using namespace pybind11::literals;  // needed to bring in _a literal
@@ -80,6 +86,103 @@ inline void assert_true(bool expr, const std::string & msg) {
 }
 
 
+inline bool file_exists(const std::string &path) {
+    std::ifstream input(path.c_str(), std::ios::binary);
+    return input.is_open();
+}
+
+
+inline std::string read_text_file(const std::string &path) {
+    std::ifstream input(path.c_str());
+    if (!input.is_open()) {
+        throw std::runtime_error("Cannot open file: " + path);
+    }
+    std::stringstream buffer;
+    buffer << input.rdbuf();
+    return buffer.str();
+}
+
+
+inline std::string json_get_string(const std::string &json, const std::string &key) {
+    std::regex re("\"" + key + "\"\\s*:\\s*\"([^\"]*)\"");
+    std::smatch match;
+    if (!std::regex_search(json, match, re)) {
+        throw std::runtime_error("Typed HNSW metadata missing string field: " + key);
+    }
+    return match[1].str();
+}
+
+
+inline size_t json_get_size_t(const std::string &json, const std::string &key) {
+    std::regex re("\"" + key + "\"\\s*:\\s*([0-9]+)");
+    std::smatch match;
+    if (!std::regex_search(json, match, re)) {
+        throw std::runtime_error("Typed HNSW metadata missing integer field: " + key);
+    }
+    return (size_t) std::stoull(match[1].str());
+}
+
+
+inline std::string json_escape(const std::string &value) {
+    std::string escaped;
+    for (size_t i = 0; i < value.size(); i++) {
+        char c = value[i];
+        if (c == '\\' || c == '"') {
+            escaped.push_back('\\');
+        }
+        escaped.push_back(c);
+    }
+    return escaped;
+}
+
+
+struct HnswHeaderInfo {
+    size_t offset_level0;
+    size_t max_elements;
+    size_t cur_element_count;
+    size_t size_data_per_element;
+    size_t label_offset;
+    size_t offset_data;
+    int max_level;
+    hnswlib::tableint enterpoint_node;
+    size_t max_M;
+    size_t max_M0;
+    size_t M;
+    double mult;
+    size_t ef_construction;
+    size_t file_size;
+};
+
+
+inline HnswHeaderInfo read_hnsw_header(const std::string &path) {
+    std::ifstream input(path.c_str(), std::ios::binary);
+    if (!input.is_open()) {
+        throw std::runtime_error("Cannot open file: " + path);
+    }
+
+    HnswHeaderInfo header;
+    input.seekg(0, input.end);
+    header.file_size = (size_t) input.tellg();
+    input.seekg(0, input.beg);
+
+    hnswlib::readBinaryPOD(input, header.offset_level0);
+    hnswlib::readBinaryPOD(input, header.max_elements);
+    hnswlib::readBinaryPOD(input, header.cur_element_count);
+    hnswlib::readBinaryPOD(input, header.size_data_per_element);
+    hnswlib::readBinaryPOD(input, header.label_offset);
+    hnswlib::readBinaryPOD(input, header.offset_data);
+    hnswlib::readBinaryPOD(input, header.max_level);
+    hnswlib::readBinaryPOD(input, header.enterpoint_node);
+    hnswlib::readBinaryPOD(input, header.max_M);
+    hnswlib::readBinaryPOD(input, header.max_M0);
+    hnswlib::readBinaryPOD(input, header.M);
+    hnswlib::readBinaryPOD(input, header.mult);
+    hnswlib::readBinaryPOD(input, header.ef_construction);
+
+    return header;
+}
+
+
 class CustomFilterFunctor: public hnswlib::BaseFilterFunctor {
     std::function<bool(hnswlib::labeltype)> filter;
 
@@ -142,8 +245,66 @@ inline std::vector<size_t> get_input_ids_and_check_shapes(const py::object& ids_
 }
 
 
+template<typename data_t>
+struct IndexDType {
+    static std::string name() {
+        return "float32";
+    }
+};
+
+template<>
+struct IndexDType<uint8_t> {
+    static std::string name() {
+        return "uint8";
+    }
+};
+
+template<>
+struct IndexDType<int8_t> {
+    static std::string name() {
+        return "int8";
+    }
+};
+
+
+template<typename data_t>
+struct DataArrayCaster {
+    typedef py::array_t<data_t, py::array::c_style | py::array::forcecast> Array;
+
+    static Array cast(py::object input) {
+        return Array(input);
+    }
+};
+
+template<>
+struct DataArrayCaster<uint8_t> {
+    typedef py::array_t<uint8_t, py::array::c_style> Array;
+
+    static Array cast(py::object input) {
+        py::array array = py::array::ensure(input);
+        if (!array || array.request().format != py::format_descriptor<uint8_t>::format()) {
+            throw std::runtime_error("Input vector dtype must match index dtype uint8.");
+        }
+        return Array(input);
+    }
+};
+
+template<>
+struct DataArrayCaster<int8_t> {
+    typedef py::array_t<int8_t, py::array::c_style> Array;
+
+    static Array cast(py::object input) {
+        py::array array = py::array::ensure(input);
+        if (!array || array.request().format != py::format_descriptor<int8_t>::format()) {
+            throw std::runtime_error("Input vector dtype must match index dtype int8.");
+        }
+        return Array(input);
+    }
+};
+
+
 template<typename dist_t, typename data_t = float>
-class Index {
+class TypedIndex {
  public:
     static const int ser_version = 1;  // serialization version
 
@@ -161,13 +322,25 @@ class Index {
     hnswlib::SpaceInterface<float>* l2space;
 
 
-    Index(const std::string &space_name, const int dim) : space_name(space_name), dim(dim) {
+    TypedIndex(const std::string &space_name, const int dim) : space_name(space_name), dim(dim) {
         normalize = false;
         if (space_name == "l2") {
-            l2space = new hnswlib::L2Space(dim);
+            if (std::is_same<data_t, float>::value) {
+                l2space = new hnswlib::L2Space(dim);
+            } else if (std::is_same<data_t, uint8_t>::value) {
+                l2space = new hnswlib::L2SpaceUInt8(dim);
+            } else if (std::is_same<data_t, int8_t>::value) {
+                l2space = new hnswlib::L2SpaceInt8(dim);
+            } else {
+                throw std::runtime_error("Unsupported index dtype.");
+            }
         } else if (space_name == "ip") {
+            if (!std::is_same<data_t, float>::value)
+                throw std::runtime_error("Integer dtypes are supported only for space='l2'.");
             l2space = new hnswlib::InnerProductSpace(dim);
         } else if (space_name == "cosine") {
+            if (!std::is_same<data_t, float>::value)
+                throw std::runtime_error("Integer dtypes are supported only for space='l2'.");
             l2space = new hnswlib::InnerProductSpace(dim);
             normalize = true;
         } else {
@@ -182,7 +355,7 @@ class Index {
     }
 
 
-    ~Index() {
+    ~TypedIndex() {
         delete l2space;
         if (appr_alg)
             delete appr_alg;
@@ -222,12 +395,120 @@ class Index {
         return appr_alg->indexFileSize();
     }
 
+    std::string dtypeName() const {
+        return IndexDType<data_t>::name();
+    }
+
+    bool isFloatIndex() const {
+        return std::is_same<data_t, float>::value;
+    }
+
+    size_t payloadBytesPerVector() const {
+        return (size_t) dim * sizeof(data_t);
+    }
+
+    void validateHeaderLayout(const HnswHeaderInfo &header) const {
+        size_t expected_payload = payloadBytesPerVector();
+        size_t expected_offset_data = sizeof(hnswlib::linklistsizeint) + header.max_M0 * sizeof(hnswlib::tableint);
+
+        if (header.offset_data != expected_offset_data)
+            throw std::runtime_error("Typed HNSW metadata validation failed: offset_data does not match max_M0 layout.");
+        if (header.label_offset < header.offset_data || header.label_offset - header.offset_data != expected_payload)
+            throw std::runtime_error("Typed HNSW metadata validation failed: vector payload byte width does not match dtype and dim.");
+        if (header.size_data_per_element != header.label_offset + sizeof(hnswlib::labeltype))
+            throw std::runtime_error("Typed HNSW metadata validation failed: size_data_per_element does not match label offset.");
+    }
+
+    void writeTypedMetadata(const std::string &path_to_index) const {
+        HnswHeaderInfo header = read_hnsw_header(path_to_index);
+        validateHeaderLayout(header);
+
+        std::ofstream output((path_to_index + ".hnswmeta.json").c_str());
+        if (!output.is_open()) {
+            throw std::runtime_error("Cannot create typed HNSW metadata sidecar.");
+        }
+
+        output << "{\n";
+        output << "  \"format\": \"hnswlib-typed-index-metadata\",\n";
+        output << "  \"version\": 1,\n";
+        output << "  \"space\": \"" << json_escape(space_name) << "\",\n";
+        output << "  \"dtype\": \"" << dtypeName() << "\",\n";
+        output << "  \"dim\": " << dim << ",\n";
+        output << "  \"distance_type\": \"float32\",\n";
+        output << "  \"payload_bytes_per_vector\": " << payloadBytesPerVector() << ",\n";
+        output << "  \"index_file\": \"" << json_escape(path_to_index) << "\",\n";
+        output << "  \"index_file_size\": " << header.file_size << ",\n";
+        output << "  \"max_elements\": " << header.max_elements << ",\n";
+        output << "  \"cur_element_count\": " << header.cur_element_count << ",\n";
+        output << "  \"size_data_per_element\": " << header.size_data_per_element << ",\n";
+        output << "  \"label_offset\": " << header.label_offset << ",\n";
+        output << "  \"offset_data\": " << header.offset_data << ",\n";
+        output << "  \"max_M\": " << header.max_M << ",\n";
+        output << "  \"max_M0\": " << header.max_M0 << ",\n";
+        output << "  \"M\": " << header.M << ",\n";
+        output << "  \"ef_construction\": " << header.ef_construction << "\n";
+        output << "}\n";
+    }
+
+    void validateTypedMetadataForLoad(const std::string &path_to_index) const {
+        std::string meta_path = path_to_index + ".hnswmeta.json";
+        if (!file_exists(meta_path)) {
+            if (isFloatIndex())
+                return;
+            throw std::runtime_error("Integer HNSW indexes require sidecar metadata: " + meta_path);
+        }
+
+        std::string json = read_text_file(meta_path);
+        if (json_get_string(json, "format") != "hnswlib-typed-index-metadata")
+            throw std::runtime_error("Typed HNSW metadata validation failed: unsupported format.");
+        if (json_get_size_t(json, "version") != 1)
+            throw std::runtime_error("Typed HNSW metadata validation failed: unsupported version.");
+        if (json_get_string(json, "space") != space_name)
+            throw std::runtime_error("Typed HNSW metadata validation failed: space mismatch.");
+        if (json_get_string(json, "dtype") != dtypeName())
+            throw std::runtime_error("Typed HNSW metadata validation failed: dtype mismatch.");
+        if (json_get_size_t(json, "dim") != (size_t) dim)
+            throw std::runtime_error("Typed HNSW metadata validation failed: dim mismatch.");
+        if (json_get_string(json, "distance_type") != "float32")
+            throw std::runtime_error("Typed HNSW metadata validation failed: distance_type mismatch.");
+        if (json_get_size_t(json, "payload_bytes_per_vector") != payloadBytesPerVector())
+            throw std::runtime_error("Typed HNSW metadata validation failed: payload byte width mismatch.");
+
+        HnswHeaderInfo header = read_hnsw_header(path_to_index);
+        validateHeaderLayout(header);
+
+        if (json_get_size_t(json, "index_file_size") != header.file_size)
+            throw std::runtime_error("Typed HNSW metadata validation failed: index file size mismatch.");
+        if (json_get_size_t(json, "max_elements") != header.max_elements)
+            throw std::runtime_error("Typed HNSW metadata validation failed: max_elements mismatch.");
+        if (json_get_size_t(json, "cur_element_count") != header.cur_element_count)
+            throw std::runtime_error("Typed HNSW metadata validation failed: cur_element_count mismatch.");
+        if (json_get_size_t(json, "size_data_per_element") != header.size_data_per_element)
+            throw std::runtime_error("Typed HNSW metadata validation failed: size_data_per_element mismatch.");
+        if (json_get_size_t(json, "label_offset") != header.label_offset)
+            throw std::runtime_error("Typed HNSW metadata validation failed: label_offset mismatch.");
+        if (json_get_size_t(json, "offset_data") != header.offset_data)
+            throw std::runtime_error("Typed HNSW metadata validation failed: offset_data mismatch.");
+        if (json_get_size_t(json, "max_M") != header.max_M)
+            throw std::runtime_error("Typed HNSW metadata validation failed: max_M mismatch.");
+        if (json_get_size_t(json, "max_M0") != header.max_M0)
+            throw std::runtime_error("Typed HNSW metadata validation failed: max_M0 mismatch.");
+        if (json_get_size_t(json, "M") != header.M)
+            throw std::runtime_error("Typed HNSW metadata validation failed: M mismatch.");
+        if (json_get_size_t(json, "ef_construction") != header.ef_construction)
+            throw std::runtime_error("Typed HNSW metadata validation failed: ef_construction mismatch.");
+    }
+
     void saveIndex(const std::string &path_to_index) {
         appr_alg->saveIndex(path_to_index);
+        if (!isFloatIndex()) {
+            writeTypedMetadata(path_to_index);
+        }
     }
 
 
     void loadIndex(const std::string &path_to_index, size_t max_elements, bool allow_replace_deleted) {
+      validateTypedMetadataForLoad(path_to_index);
       if (appr_alg) {
           std::cerr << "Warning: Calling load_index for an already inited index. Old index is being deallocated." << std::endl;
           delete appr_alg;
@@ -249,7 +530,7 @@ class Index {
 
 
     void addItems(py::object input, py::object ids_ = py::none(), int num_threads = -1, bool replace_deleted = false) {
-        py::array_t < dist_t, py::array::c_style | py::array::forcecast > items(input);
+        typename DataArrayCaster<data_t>::Array items = DataArrayCaster<data_t>::cast(input);
         auto buffer = items.request();
         if (num_threads <= 0)
             num_threads = num_threads_default;
@@ -271,13 +552,14 @@ class Index {
             int start = 0;
             if (!ep_added) {
                 size_t id = ids.size() ? ids.at(0) : (cur_l);
-                float* vector_data = (float*)items.data(0);
+                data_t* vector_data = (data_t*)items.data(0);
                 std::vector<float> norm_array(dim);
                 if (normalize) {
-                    normalize_vector(vector_data, norm_array.data());
-                    vector_data = norm_array.data();
+                    normalize_vector((float*)vector_data, norm_array.data());
+                    appr_alg->addPoint((void*)norm_array.data(), (size_t)id, replace_deleted);
+                } else {
+                    appr_alg->addPoint((void*)vector_data, (size_t)id, replace_deleted);
                 }
-                appr_alg->addPoint((void*)vector_data, (size_t)id, replace_deleted);
                 start = 1;
                 ep_added = true;
             }
@@ -464,8 +746,9 @@ class Index {
 
     py::dict getIndexParams() const { /* WARNING: Index::getAnnData is not thread-safe with Index::addItems */
         auto params = py::dict(
-            "ser_version"_a = py::int_(Index<float>::ser_version),  // serialization version
+            "ser_version"_a = py::int_(TypedIndex<dist_t, data_t>::ser_version),  // serialization version
             "space"_a = space_name,
+            "dtype"_a = dtypeName(),
             "dim"_a = dim,
             "index_inited"_a = index_inited,
             "ep_added"_a = ep_added,
@@ -482,15 +765,20 @@ class Index {
     }
 
 
-    static Index<float>* createFromParams(const py::dict d) {
+    static TypedIndex<dist_t, data_t>* createFromParams(const py::dict d) {
         // check serialization version
-        assert_true(((int)py::int_(Index<float>::ser_version)) >= d["ser_version"].cast<int>(), "Invalid serialization version!");
+        assert_true(((int)py::int_(TypedIndex<dist_t, data_t>::ser_version)) >= d["ser_version"].cast<int>(), "Invalid serialization version!");
 
         auto space_name_ = d["space"].cast<std::string>();
+        if (d.contains("dtype")) {
+            assert_true(d["dtype"].cast<std::string>() == IndexDType<data_t>::name(), "Invalid dtype!");
+        } else {
+            assert_true(std::is_same<data_t, float>::value, "Missing dtype!");
+        }
         auto dim_ = d["dim"].cast<int>();
         auto index_inited_ = d["index_inited"].cast<bool>();
 
-        Index<float>* new_index = new Index<float>(space_name_, dim_);
+        TypedIndex<dist_t, data_t>* new_index = new TypedIndex<dist_t, data_t>(space_name_, dim_);
 
         /*  TODO: deserialize state of random generators into new_index->level_generator_ and new_index->update_probability_generator_  */
         /*        for full reproducibility / state of generators is serialized inside Index::getIndexParams                      */
@@ -518,7 +806,7 @@ class Index {
     }
 
 
-    static Index<float> * createFromIndex(const Index<float> & index) {
+    static TypedIndex<dist_t, data_t> * createFromIndex(const TypedIndex<dist_t, data_t> & index) {
         return createFromParams(index.getIndexParams());
     }
 
@@ -614,7 +902,7 @@ class Index {
         size_t k = 1,
         int num_threads = -1,
         const std::function<bool(hnswlib::labeltype)>& filter = nullptr) {
-        py::array_t < dist_t, py::array::c_style | py::array::forcecast > items(input);
+        typename DataArrayCaster<data_t>::Array items = DataArrayCaster<data_t>::cast(input);
         auto buffer = items.request();
         hnswlib::labeltype* data_numpy_l;
         dist_t* data_numpy_d;
@@ -626,6 +914,8 @@ class Index {
         {
             py::gil_scoped_release l;
             get_input_array_shapes(buffer, &rows, &features);
+            if (features != dim)
+                throw std::runtime_error("Wrong dimensionality of the vectors");
 
             // avoid using threads when the number of searches is small:
             if (rows <= num_threads * 4) {
@@ -719,6 +1009,196 @@ class Index {
 
     size_t getCurrentCount() const {
         return appr_alg->cur_element_count;
+    }
+};
+
+class Index {
+ public:
+    std::string space_name;
+    int dim;
+    std::string dtype;
+
+    std::unique_ptr<TypedIndex<float, float>> float_index;
+    std::unique_ptr<TypedIndex<float, uint8_t>> uint8_index;
+    std::unique_ptr<TypedIndex<float, int8_t>> int8_index;
+
+    Index(const std::string &space_name, const int dim, const std::string &dtype = "float32")
+        : space_name(space_name), dim(dim), dtype(dtype) {
+        if (dtype == "float32") {
+            float_index.reset(new TypedIndex<float, float>(space_name, dim));
+        } else if (dtype == "uint8") {
+            uint8_index.reset(new TypedIndex<float, uint8_t>(space_name, dim));
+        } else if (dtype == "int8") {
+            int8_index.reset(new TypedIndex<float, int8_t>(space_name, dim));
+        } else {
+            throw std::runtime_error("dtype must be one of float32, uint8, or int8.");
+        }
+    }
+
+    void init_new_index(size_t maxElements, size_t M, size_t efConstruction, size_t random_seed, bool allow_replace_deleted) {
+        if (float_index) return float_index->init_new_index(maxElements, M, efConstruction, random_seed, allow_replace_deleted);
+        if (uint8_index) return uint8_index->init_new_index(maxElements, M, efConstruction, random_seed, allow_replace_deleted);
+        return int8_index->init_new_index(maxElements, M, efConstruction, random_seed, allow_replace_deleted);
+    }
+
+    void set_ef(size_t ef) {
+        if (float_index) return float_index->set_ef(ef);
+        if (uint8_index) return uint8_index->set_ef(ef);
+        return int8_index->set_ef(ef);
+    }
+
+    void set_num_threads(int num_threads) {
+        if (float_index) return float_index->set_num_threads(num_threads);
+        if (uint8_index) return uint8_index->set_num_threads(num_threads);
+        return int8_index->set_num_threads(num_threads);
+    }
+
+    int get_num_threads() const {
+        if (float_index) return float_index->num_threads_default;
+        if (uint8_index) return uint8_index->num_threads_default;
+        return int8_index->num_threads_default;
+    }
+
+    size_t indexFileSize() const {
+        if (float_index) return float_index->indexFileSize();
+        if (uint8_index) return uint8_index->indexFileSize();
+        return int8_index->indexFileSize();
+    }
+
+    void saveIndex(const std::string &path_to_index) {
+        if (float_index) return float_index->saveIndex(path_to_index);
+        if (uint8_index) return uint8_index->saveIndex(path_to_index);
+        return int8_index->saveIndex(path_to_index);
+    }
+
+    void loadIndex(const std::string &path_to_index, size_t max_elements, bool allow_replace_deleted) {
+        if (float_index) return float_index->loadIndex(path_to_index, max_elements, allow_replace_deleted);
+        if (uint8_index) return uint8_index->loadIndex(path_to_index, max_elements, allow_replace_deleted);
+        return int8_index->loadIndex(path_to_index, max_elements, allow_replace_deleted);
+    }
+
+    void addItems(py::object input, py::object ids_ = py::none(), int num_threads = -1, bool replace_deleted = false) {
+        if (float_index) return float_index->addItems(input, ids_, num_threads, replace_deleted);
+        if (uint8_index) return uint8_index->addItems(input, ids_, num_threads, replace_deleted);
+        return int8_index->addItems(input, ids_, num_threads, replace_deleted);
+    }
+
+    py::object getData(py::object ids_ = py::none(), std::string return_type = "numpy") {
+        if (float_index) return float_index->getData(ids_, return_type);
+        if (uint8_index) return uint8_index->getData(ids_, return_type);
+        return int8_index->getData(ids_, return_type);
+    }
+
+    std::vector<hnswlib::labeltype> getIdsList() {
+        if (float_index) return float_index->getIdsList();
+        if (uint8_index) return uint8_index->getIdsList();
+        return int8_index->getIdsList();
+    }
+
+    py::object knnQuery_return_numpy(
+        py::object input,
+        size_t k = 1,
+        int num_threads = -1,
+        const std::function<bool(hnswlib::labeltype)>& filter = nullptr) {
+        if (float_index) return float_index->knnQuery_return_numpy(input, k, num_threads, filter);
+        if (uint8_index) return uint8_index->knnQuery_return_numpy(input, k, num_threads, filter);
+        return int8_index->knnQuery_return_numpy(input, k, num_threads, filter);
+    }
+
+    void markDeleted(size_t label) {
+        if (float_index) return float_index->markDeleted(label);
+        if (uint8_index) return uint8_index->markDeleted(label);
+        return int8_index->markDeleted(label);
+    }
+
+    void unmarkDeleted(size_t label) {
+        if (float_index) return float_index->unmarkDeleted(label);
+        if (uint8_index) return uint8_index->unmarkDeleted(label);
+        return int8_index->unmarkDeleted(label);
+    }
+
+    void resizeIndex(size_t new_size) {
+        if (float_index) return float_index->resizeIndex(new_size);
+        if (uint8_index) return uint8_index->resizeIndex(new_size);
+        return int8_index->resizeIndex(new_size);
+    }
+
+    size_t getMaxElements() const {
+        if (float_index) return float_index->getMaxElements();
+        if (uint8_index) return uint8_index->getMaxElements();
+        return int8_index->getMaxElements();
+    }
+
+    size_t getCurrentCount() const {
+        if (float_index) return float_index->getCurrentCount();
+        if (uint8_index) return uint8_index->getCurrentCount();
+        return int8_index->getCurrentCount();
+    }
+
+    py::dict getIndexParams() const {
+        if (float_index) return float_index->getIndexParams();
+        if (uint8_index) return uint8_index->getIndexParams();
+        return int8_index->getIndexParams();
+    }
+
+    bool isInited() const {
+        if (float_index) return float_index->index_inited;
+        if (uint8_index) return uint8_index->index_inited;
+        return int8_index->index_inited;
+    }
+
+    size_t getEf() const {
+        if (float_index) return float_index->index_inited ? float_index->appr_alg->ef_ : float_index->default_ef;
+        if (uint8_index) return uint8_index->index_inited ? uint8_index->appr_alg->ef_ : uint8_index->default_ef;
+        return int8_index->index_inited ? int8_index->appr_alg->ef_ : int8_index->default_ef;
+    }
+
+    void setEf(size_t ef) {
+        set_ef(ef);
+    }
+
+    size_t getMaxElementsProperty() const {
+        if (float_index) return float_index->index_inited ? float_index->appr_alg->max_elements_ : 0;
+        if (uint8_index) return uint8_index->index_inited ? uint8_index->appr_alg->max_elements_ : 0;
+        return int8_index->index_inited ? int8_index->appr_alg->max_elements_ : 0;
+    }
+
+    size_t getElementCountProperty() const {
+        if (float_index) return float_index->index_inited ? (size_t)float_index->appr_alg->cur_element_count : 0;
+        if (uint8_index) return uint8_index->index_inited ? (size_t)uint8_index->appr_alg->cur_element_count : 0;
+        return int8_index->index_inited ? (size_t)int8_index->appr_alg->cur_element_count : 0;
+    }
+
+    size_t getEfConstructionProperty() const {
+        if (float_index) return float_index->index_inited ? float_index->appr_alg->ef_construction_ : 0;
+        if (uint8_index) return uint8_index->index_inited ? uint8_index->appr_alg->ef_construction_ : 0;
+        return int8_index->index_inited ? int8_index->appr_alg->ef_construction_ : 0;
+    }
+
+    size_t getMProperty() const {
+        if (float_index) return float_index->index_inited ? float_index->appr_alg->M_ : 0;
+        if (uint8_index) return uint8_index->index_inited ? uint8_index->appr_alg->M_ : 0;
+        return int8_index->index_inited ? int8_index->appr_alg->M_ : 0;
+    }
+
+    static Index* createFromParams(const py::dict d) {
+        std::string dtype_ = d.contains("dtype") ? d["dtype"].cast<std::string>() : "float32";
+        Index *index = new Index(d["space"].cast<std::string>(), d["dim"].cast<int>(), dtype_);
+        if (dtype_ == "float32") {
+            index->float_index.reset(TypedIndex<float, float>::createFromParams(d));
+        } else if (dtype_ == "uint8") {
+            index->uint8_index.reset(TypedIndex<float, uint8_t>::createFromParams(d));
+        } else if (dtype_ == "int8") {
+            index->int8_index.reset(TypedIndex<float, int8_t>::createFromParams(d));
+        } else {
+            delete index;
+            throw std::runtime_error("dtype must be one of float32, uint8, or int8.");
+        }
+        return index;
+    }
+
+    static Index* createFromIndex(const Index &index) {
+        return createFromParams(index.getIndexParams());
     }
 };
 
@@ -933,83 +1413,70 @@ class BFIndex {
 PYBIND11_PLUGIN(hnswlib) {
         py::module m("hnswlib");
 
-        py::class_<Index<float>>(m, "Index")
-        .def(py::init(&Index<float>::createFromParams), py::arg("params"))
+        py::class_<Index>(m, "Index")
+        .def(py::init(&Index::createFromParams), py::arg("params"))
            /* WARNING: Index::createFromIndex is not thread-safe with Index::addItems */
-        .def(py::init(&Index<float>::createFromIndex), py::arg("index"))
-        .def(py::init<const std::string &, const int>(), py::arg("space"), py::arg("dim"))
+        .def(py::init(&Index::createFromIndex), py::arg("index"))
+        .def(py::init<const std::string &, const int, const std::string &>(), py::arg("space"), py::arg("dim"), py::arg("dtype") = "float32")
         .def("init_index",
-            &Index<float>::init_new_index,
+            &Index::init_new_index,
             py::arg("max_elements"),
             py::arg("M") = 16,
             py::arg("ef_construction") = 200,
             py::arg("random_seed") = 100,
             py::arg("allow_replace_deleted") = false)
         .def("knn_query",
-            &Index<float>::knnQuery_return_numpy,
+            &Index::knnQuery_return_numpy,
             py::arg("data"),
             py::arg("k") = 1,
             py::arg("num_threads") = -1,
             py::arg("filter") = py::none())
         .def("add_items",
-            &Index<float>::addItems,
+            &Index::addItems,
             py::arg("data"),
             py::arg("ids") = py::none(),
             py::arg("num_threads") = -1,
             py::arg("replace_deleted") = false)
-        .def("get_items", &Index<float>::getData, py::arg("ids") = py::none(), py::arg("return_type") = "numpy")
-        .def("get_ids_list", &Index<float>::getIdsList)
-        .def("set_ef", &Index<float>::set_ef, py::arg("ef"))
-        .def("set_num_threads", &Index<float>::set_num_threads, py::arg("num_threads"))
-        .def("index_file_size", &Index<float>::indexFileSize)
-        .def("save_index", &Index<float>::saveIndex, py::arg("path_to_index"))
+        .def("get_items", &Index::getData, py::arg("ids") = py::none(), py::arg("return_type") = "numpy")
+        .def("get_ids_list", &Index::getIdsList)
+        .def("set_ef", &Index::set_ef, py::arg("ef"))
+        .def("set_num_threads", &Index::set_num_threads, py::arg("num_threads"))
+        .def("index_file_size", &Index::indexFileSize)
+        .def("save_index", &Index::saveIndex, py::arg("path_to_index"))
         .def("load_index",
-            &Index<float>::loadIndex,
+            &Index::loadIndex,
             py::arg("path_to_index"),
             py::arg("max_elements") = 0,
             py::arg("allow_replace_deleted") = false)
-        .def("mark_deleted", &Index<float>::markDeleted, py::arg("label"))
-        .def("unmark_deleted", &Index<float>::unmarkDeleted, py::arg("label"))
-        .def("resize_index", &Index<float>::resizeIndex, py::arg("new_size"))
-        .def("get_max_elements", &Index<float>::getMaxElements)
-        .def("get_current_count", &Index<float>::getCurrentCount)
-        .def_readonly("space", &Index<float>::space_name)
-        .def_readonly("dim", &Index<float>::dim)
-        .def_readwrite("num_threads", &Index<float>::num_threads_default)
+        .def("mark_deleted", &Index::markDeleted, py::arg("label"))
+        .def("unmark_deleted", &Index::unmarkDeleted, py::arg("label"))
+        .def("resize_index", &Index::resizeIndex, py::arg("new_size"))
+        .def("get_max_elements", &Index::getMaxElements)
+        .def("get_current_count", &Index::getCurrentCount)
+        .def_readonly("space", &Index::space_name)
+        .def_readonly("dim", &Index::dim)
+        .def_readonly("dtype", &Index::dtype)
+        .def_property("num_threads", &Index::get_num_threads, &Index::set_num_threads)
         .def_property("ef",
-          [](const Index<float> & index) {
-            return index.index_inited ? index.appr_alg->ef_ : index.default_ef;
-          },
-          [](Index<float> & index, const size_t ef_) {
-            index.default_ef = ef_;
-            if (index.appr_alg)
-              index.appr_alg->ef_ = ef_;
-        })
-        .def_property_readonly("max_elements", [](const Index<float> & index) {
-            return index.index_inited ? index.appr_alg->max_elements_ : 0;
-        })
-        .def_property_readonly("element_count", [](const Index<float> & index) {
-            return index.index_inited ? (size_t)index.appr_alg->cur_element_count : 0;
-        })
-        .def_property_readonly("ef_construction", [](const Index<float> & index) {
-          return index.index_inited ? index.appr_alg->ef_construction_ : 0;
-        })
-        .def_property_readonly("M",  [](const Index<float> & index) {
-          return index.index_inited ? index.appr_alg->M_ : 0;
-        })
+          &Index::getEf,
+          &Index::setEf)
+        .def_property_readonly("max_elements", &Index::getMaxElementsProperty)
+        .def_property_readonly("element_count", &Index::getElementCountProperty)
+        .def_property_readonly("ef_construction", &Index::getEfConstructionProperty)
+        .def_property_readonly("M", &Index::getMProperty)
 
         .def(py::pickle(
-            [](const Index<float> &ind) {  // __getstate__
+            [](const Index &ind) {  // __getstate__
                 return py::make_tuple(ind.getIndexParams()); /* Return dict (wrapped in a tuple) that fully encodes state of the Index object */
             },
             [](py::tuple t) {  // __setstate__
                 if (t.size() != 1)
                     throw std::runtime_error("Invalid state!");
-                return Index<float>::createFromParams(t[0].cast<py::dict>());
+                return Index::createFromParams(t[0].cast<py::dict>());
             }))
 
-        .def("__repr__", [](const Index<float> &a) {
-            return "<hnswlib.Index(space='" + a.space_name + "', dim="+std::to_string(a.dim)+")>";
+        .def("__repr__", [](const Index &a) {
+            return "<hnswlib.Index(space='" + a.space_name + "', dim="+std::to_string(a.dim)+", dtype='"+a.dtype+"')>";
         });
 
         py::class_<BFIndex<float>>(m, "BFIndex")
