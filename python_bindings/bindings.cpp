@@ -8,6 +8,7 @@
 #include <atomic>
 #include <stdlib.h>
 #include <assert.h>
+#include <chrono>
 #include <cstdint>
 #include <fstream>
 #include <memory>
@@ -986,6 +987,109 @@ class TypedIndex {
                 free_when_done_d));
     }
 
+    py::object knnQueryWithLatency_return_numpy(
+        py::object input,
+        size_t k = 1,
+        int num_threads = -1,
+        const std::function<bool(hnswlib::labeltype)>& filter = nullptr) {
+        typename DataArrayCaster<data_t>::Array items = DataArrayCaster<data_t>::cast(input);
+        auto buffer = items.request();
+        hnswlib::labeltype* data_numpy_l;
+        dist_t* data_numpy_d;
+        double* data_numpy_latency_ms;
+        size_t rows, features;
+
+        if (num_threads <= 0)
+            num_threads = num_threads_default;
+
+        {
+            py::gil_scoped_release l;
+            get_input_array_shapes(buffer, &rows, &features);
+            if (features != dim)
+                throw std::runtime_error("Wrong dimensionality of the vectors");
+
+            if (rows <= num_threads * 4) {
+                num_threads = 1;
+            }
+
+            data_numpy_l = new hnswlib::labeltype[rows * k];
+            data_numpy_d = new dist_t[rows * k];
+            data_numpy_latency_ms = new double[rows];
+
+            CustomFilterFunctor idFilter(filter);
+            CustomFilterFunctor* p_idFilter = filter ? &idFilter : nullptr;
+
+            if (normalize == false) {
+                ParallelFor(0, rows, num_threads, [&](size_t row, size_t threadId) {
+                    const auto start = std::chrono::steady_clock::now();
+                    std::priority_queue<std::pair<dist_t, hnswlib::labeltype >> result = appr_alg->searchKnn(
+                        (void*)items.data(row), k, p_idFilter);
+                    const auto finish = std::chrono::steady_clock::now();
+                    data_numpy_latency_ms[row] =
+                        std::chrono::duration<double, std::milli>(finish - start).count();
+                    if (result.size() != k)
+                        throw std::runtime_error(
+                            "Cannot return the results in a contiguous 2D array. Probably ef or M is too small");
+                    for (int i = k - 1; i >= 0; i--) {
+                        auto& result_tuple = result.top();
+                        data_numpy_d[row * k + i] = result_tuple.first;
+                        data_numpy_l[row * k + i] = result_tuple.second;
+                        result.pop();
+                    }
+                });
+            } else {
+                std::vector<float> norm_array(num_threads * features);
+                ParallelFor(0, rows, num_threads, [&](size_t row, size_t threadId) {
+                    size_t start_idx = threadId * dim;
+                    normalize_vector((float*)items.data(row), (norm_array.data() + start_idx));
+
+                    const auto start = std::chrono::steady_clock::now();
+                    std::priority_queue<std::pair<dist_t, hnswlib::labeltype >> result = appr_alg->searchKnn(
+                        (void*)(norm_array.data() + start_idx), k, p_idFilter);
+                    const auto finish = std::chrono::steady_clock::now();
+                    data_numpy_latency_ms[row] =
+                        std::chrono::duration<double, std::milli>(finish - start).count();
+                    if (result.size() != k)
+                        throw std::runtime_error(
+                            "Cannot return the results in a contiguous 2D array. Probably ef or M is too small");
+                    for (int i = k - 1; i >= 0; i--) {
+                        auto& result_tuple = result.top();
+                        data_numpy_d[row * k + i] = result_tuple.first;
+                        data_numpy_l[row * k + i] = result_tuple.second;
+                        result.pop();
+                    }
+                });
+            }
+        }
+        py::capsule free_when_done_l(data_numpy_l, [](void* f) {
+            delete[] f;
+            });
+        py::capsule free_when_done_d(data_numpy_d, [](void* f) {
+            delete[] f;
+            });
+        py::capsule free_when_done_latency(data_numpy_latency_ms, [](void* f) {
+            delete[] f;
+            });
+
+        return py::make_tuple(
+            py::array_t<hnswlib::labeltype>(
+                { rows, k },
+                { k * sizeof(hnswlib::labeltype),
+                  sizeof(hnswlib::labeltype) },
+                data_numpy_l,
+                free_when_done_l),
+            py::array_t<dist_t>(
+                { rows, k },
+                { k * sizeof(dist_t), sizeof(dist_t) },
+                data_numpy_d,
+                free_when_done_d),
+            py::array_t<double>(
+                { rows },
+                { sizeof(double) },
+                data_numpy_latency_ms,
+                free_when_done_latency));
+    }
+
 
     void markDeleted(size_t label) {
         appr_alg->markDelete(label);
@@ -1103,6 +1207,16 @@ class Index {
         if (float_index) return float_index->knnQuery_return_numpy(input, k, num_threads, filter);
         if (uint8_index) return uint8_index->knnQuery_return_numpy(input, k, num_threads, filter);
         return int8_index->knnQuery_return_numpy(input, k, num_threads, filter);
+    }
+
+    py::object knnQueryWithLatency_return_numpy(
+        py::object input,
+        size_t k = 1,
+        int num_threads = -1,
+        const std::function<bool(hnswlib::labeltype)>& filter = nullptr) {
+        if (float_index) return float_index->knnQueryWithLatency_return_numpy(input, k, num_threads, filter);
+        if (uint8_index) return uint8_index->knnQueryWithLatency_return_numpy(input, k, num_threads, filter);
+        return int8_index->knnQueryWithLatency_return_numpy(input, k, num_threads, filter);
     }
 
     void markDeleted(size_t label) {
@@ -1427,6 +1541,12 @@ PYBIND11_PLUGIN(hnswlib) {
             py::arg("allow_replace_deleted") = false)
         .def("knn_query",
             &Index::knnQuery_return_numpy,
+            py::arg("data"),
+            py::arg("k") = 1,
+            py::arg("num_threads") = -1,
+            py::arg("filter") = py::none())
+        .def("knn_query_with_latency",
+            &Index::knnQueryWithLatency_return_numpy,
             py::arg("data"),
             py::arg("k") = 1,
             py::arg("num_threads") = -1,
