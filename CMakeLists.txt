@@ -94,6 +94,9 @@ if(HNSWLIB_EXAMPLES)
     add_executable(searchKnnWithFilter_test tests/cpp/searchKnnWithFilter_test.cpp)
     target_link_libraries(searchKnnWithFilter_test hnswlib)
 
+    add_executable(search_access_metrics_test tests/cpp/search_access_metrics_test.cpp)
+    target_link_libraries(search_access_metrics_test hnswlib)
+
     add_executable(multiThreadLoad_test tests/cpp/multiThreadLoad_test.cpp)
     target_link_libraries(multiThreadLoad_test hnswlib)
 
