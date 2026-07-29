@@ -80,12 +80,24 @@ void test_search_access_metrics() {
     index.setEf(64);
 
     const float query[dimension] = {0.15f, 0.35f, 0.55f, 0.75f};
+    assert(!index.searchAccessMetricsEnabled());
+    index.resetSearchAccessMetrics();
+    distance_calls.store(0, std::memory_order_relaxed);
+    const auto baseline_result = consume(index.searchKnn(query, k));
+    const hnswlib::SearchAccessMetrics disabled =
+        index.getSearchAccessMetrics();
+    assert(disabled.vector_accesses() == 0);
+    assert(disabled.neighbor_list_accesses() == 0);
+
+    index.setSearchAccessMetricsEnabled(true);
+    assert(index.searchAccessMetricsEnabled());
     index.resetSearchAccessMetrics();
     distance_calls.store(0, std::memory_order_relaxed);
     const auto first_result = consume(index.searchKnn(query, k));
     const hnswlib::SearchAccessMetrics first =
         index.getSearchAccessMetrics();
 
+    assert(first_result == baseline_result);
     assert(first.entrypoint_vector_accesses == 1);
     assert(first.upper_neighbor_list_accesses > 0);
     assert(first.upper_vector_accesses > 0);

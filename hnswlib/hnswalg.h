@@ -90,6 +90,15 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
     mutable std::atomic<uint64_t> metric_upper_vector_accesses{0};
     mutable std::atomic<uint64_t> metric_l0_neighbor_list_accesses{0};
     mutable std::atomic<uint64_t> metric_l0_vector_accesses{0};
+    mutable std::atomic<bool> collect_search_access_metrics_{false};
+
+    void setSearchAccessMetricsEnabled(bool enabled) const {
+        collect_search_access_metrics_.store(enabled, std::memory_order_relaxed);
+    }
+
+    bool searchAccessMetricsEnabled() const {
+        return collect_search_access_metrics_.load(std::memory_order_relaxed);
+    }
 
     SearchAccessMetrics getSearchAccessMetrics() const {
         SearchAccessMetrics result;
@@ -1345,10 +1354,14 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         std::priority_queue<std::pair<dist_t, labeltype >> result;
         if (cur_element_count == 0) return result;
 
-        SearchAccessMetrics access_metrics;
+        SearchAccessMetrics access_metrics_storage;
+        SearchAccessMetrics *access_metrics =
+            searchAccessMetricsEnabled() ? &access_metrics_storage : nullptr;
         tableint currObj = enterpoint_node_;
         dist_t curdist = fstdistfunc_(query_data, getDataByInternalId(enterpoint_node_), dist_func_param_);
-        access_metrics.entrypoint_vector_accesses++;
+        if (access_metrics) {
+            access_metrics->entrypoint_vector_accesses++;
+        }
 
         for (int level = maxlevel_; level > 0; level--) {
             bool changed = true;
@@ -1358,7 +1371,9 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 
                 data = (unsigned int *) get_linklist(currObj, level);
                 int size = getListCount(data);
-                access_metrics.upper_neighbor_list_accesses++;
+                if (access_metrics) {
+                    access_metrics->upper_neighbor_list_accesses++;
+                }
                 metric_hops++;
                 metric_distance_computations+=size;
 
@@ -1368,7 +1383,9 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
                     if (cand < 0 || cand > max_elements_)
                         throw std::runtime_error("cand error");
                     dist_t d = fstdistfunc_(query_data, getDataByInternalId(cand), dist_func_param_);
-                    access_metrics.upper_vector_accesses++;
+                    if (access_metrics) {
+                        access_metrics->upper_vector_accesses++;
+                    }
 
                     if (d < curdist) {
                         curdist = d;
@@ -1383,12 +1400,14 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         bool bare_bone_search = !num_deleted_ && !isIdAllowed;
         if (bare_bone_search) {
             top_candidates = searchBaseLayerST<true>(
-                    currObj, query_data, std::max(ef_, k), isIdAllowed, nullptr, &access_metrics);
+                    currObj, query_data, std::max(ef_, k), isIdAllowed, nullptr, access_metrics);
         } else {
             top_candidates = searchBaseLayerST<false>(
-                    currObj, query_data, std::max(ef_, k), isIdAllowed, nullptr, &access_metrics);
+                    currObj, query_data, std::max(ef_, k), isIdAllowed, nullptr, access_metrics);
         }
-        recordSearchAccessMetrics(access_metrics);
+        if (access_metrics) {
+            recordSearchAccessMetrics(*access_metrics);
+        }
 
         while (top_candidates.size() > k) {
             top_candidates.pop();
@@ -1410,10 +1429,14 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         std::vector<std::pair<dist_t, labeltype >> result;
         if (cur_element_count == 0) return result;
 
-        SearchAccessMetrics access_metrics;
+        SearchAccessMetrics access_metrics_storage;
+        SearchAccessMetrics *access_metrics =
+            searchAccessMetricsEnabled() ? &access_metrics_storage : nullptr;
         tableint currObj = enterpoint_node_;
         dist_t curdist = fstdistfunc_(query_data, getDataByInternalId(enterpoint_node_), dist_func_param_);
-        access_metrics.entrypoint_vector_accesses++;
+        if (access_metrics) {
+            access_metrics->entrypoint_vector_accesses++;
+        }
 
         for (int level = maxlevel_; level > 0; level--) {
             bool changed = true;
@@ -1423,7 +1446,9 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 
                 data = (unsigned int *) get_linklist(currObj, level);
                 int size = getListCount(data);
-                access_metrics.upper_neighbor_list_accesses++;
+                if (access_metrics) {
+                    access_metrics->upper_neighbor_list_accesses++;
+                }
                 metric_hops++;
                 metric_distance_computations+=size;
 
@@ -1433,7 +1458,9 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
                     if (cand < 0 || cand > max_elements_)
                         throw std::runtime_error("cand error");
                     dist_t d = fstdistfunc_(query_data, getDataByInternalId(cand), dist_func_param_);
-                    access_metrics.upper_vector_accesses++;
+                    if (access_metrics) {
+                        access_metrics->upper_vector_accesses++;
+                    }
 
                     if (d < curdist) {
                         curdist = d;
@@ -1446,8 +1473,10 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 
         std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst> top_candidates;
         top_candidates = searchBaseLayerST<false>(
-            currObj, query_data, 0, isIdAllowed, &stop_condition, &access_metrics);
-        recordSearchAccessMetrics(access_metrics);
+            currObj, query_data, 0, isIdAllowed, &stop_condition, access_metrics);
+        if (access_metrics) {
+            recordSearchAccessMetrics(*access_metrics);
+        }
 
         size_t sz = top_candidates.size();
         result.resize(sz);

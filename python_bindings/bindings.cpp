@@ -392,6 +392,39 @@ class TypedIndex {
         this->num_threads_default = num_threads;
     }
 
+    void setSearchAccessMetricsEnabled(bool enabled) {
+        if (!appr_alg)
+            throw std::runtime_error("The index is not initialized.");
+        appr_alg->setSearchAccessMetricsEnabled(enabled);
+    }
+
+    void resetSearchAccessMetrics() {
+        if (!appr_alg)
+            throw std::runtime_error("The index is not initialized.");
+        appr_alg->resetSearchAccessMetrics();
+    }
+
+    py::dict getSearchAccessMetrics() const {
+        if (!appr_alg)
+            throw std::runtime_error("The index is not initialized.");
+        const hnswlib::SearchAccessMetrics metrics =
+            appr_alg->getSearchAccessMetrics();
+        py::dict result;
+        result["enabled"] = appr_alg->searchAccessMetricsEnabled();
+        result["entrypoint_vector_accesses"] =
+            metrics.entrypoint_vector_accesses;
+        result["upper_neighbor_list_accesses"] =
+            metrics.upper_neighbor_list_accesses;
+        result["upper_vector_accesses"] = metrics.upper_vector_accesses;
+        result["l0_neighbor_list_accesses"] =
+            metrics.l0_neighbor_list_accesses;
+        result["l0_vector_accesses"] = metrics.l0_vector_accesses;
+        result["neighbor_list_accesses"] =
+            metrics.neighbor_list_accesses();
+        result["vector_accesses"] = metrics.vector_accesses();
+        return result;
+    }
+
     size_t indexFileSize() const {
         return appr_alg->indexFileSize();
     }
@@ -1157,6 +1190,24 @@ class Index {
         return int8_index->set_num_threads(num_threads);
     }
 
+    void setSearchAccessMetricsEnabled(bool enabled) {
+        if (float_index) return float_index->setSearchAccessMetricsEnabled(enabled);
+        if (uint8_index) return uint8_index->setSearchAccessMetricsEnabled(enabled);
+        return int8_index->setSearchAccessMetricsEnabled(enabled);
+    }
+
+    void resetSearchAccessMetrics() {
+        if (float_index) return float_index->resetSearchAccessMetrics();
+        if (uint8_index) return uint8_index->resetSearchAccessMetrics();
+        return int8_index->resetSearchAccessMetrics();
+    }
+
+    py::dict getSearchAccessMetrics() const {
+        if (float_index) return float_index->getSearchAccessMetrics();
+        if (uint8_index) return uint8_index->getSearchAccessMetrics();
+        return int8_index->getSearchAccessMetrics();
+    }
+
     int get_num_threads() const {
         if (float_index) return float_index->num_threads_default;
         if (uint8_index) return uint8_index->num_threads_default;
@@ -1561,6 +1612,13 @@ PYBIND11_PLUGIN(hnswlib) {
         .def("get_ids_list", &Index::getIdsList)
         .def("set_ef", &Index::set_ef, py::arg("ef"))
         .def("set_num_threads", &Index::set_num_threads, py::arg("num_threads"))
+        .def("set_search_access_metrics_enabled",
+            &Index::setSearchAccessMetricsEnabled,
+            py::arg("enabled"))
+        .def("reset_search_access_metrics",
+            &Index::resetSearchAccessMetrics)
+        .def("get_search_access_metrics",
+            &Index::getSearchAccessMetrics)
         .def("index_file_size", &Index::indexFileSize)
         .def("save_index", &Index::saveIndex, py::arg("path_to_index"))
         .def("load_index",
