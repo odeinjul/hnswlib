@@ -10,6 +10,12 @@
 #include <unordered_set>
 #include <list>
 #include <memory>
+#if defined(__unix__) || defined(__APPLE__)
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
 
 namespace hnswlib {
 typedef unsigned int tableint;
@@ -71,6 +77,11 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
     char *data_level0_memory_{nullptr};
     char **linkLists_{nullptr};
     std::vector<int> element_levels_;  // keeps level of each element
+#if defined(__unix__) || defined(__APPLE__)
+    void *read_only_mmap_base_{nullptr};
+    size_t read_only_mmap_size_{0};
+#endif
+    bool read_only_mmap_{false};
 
     size_t data_size_{0};
 
@@ -222,14 +233,24 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
     }
 
     void clear() {
-        free(data_level0_memory_);
-        data_level0_memory_ = nullptr;
-        for (tableint i = 0; i < cur_element_count; i++) {
-            if (element_levels_[i] > 0)
-                free(linkLists_[i]);
+        if (!read_only_mmap_) {
+            free(data_level0_memory_);
+            for (tableint i = 0; i < cur_element_count; i++) {
+                if (linkLists_ != nullptr && element_levels_[i] > 0)
+                    free(linkLists_[i]);
+            }
         }
+        data_level0_memory_ = nullptr;
         free(linkLists_);
         linkLists_ = nullptr;
+#if defined(__unix__) || defined(__APPLE__)
+        if (read_only_mmap_base_ != nullptr) {
+            munmap(read_only_mmap_base_, read_only_mmap_size_);
+            read_only_mmap_base_ = nullptr;
+            read_only_mmap_size_ = 0;
+        }
+#endif
+        read_only_mmap_ = false;
         cur_element_count = 0;
         visited_list_pool_.reset(nullptr);
     }
@@ -901,6 +922,133 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         input.close();
 
         return;
+    }
+
+    // Query-only loader for indexes that are too large to duplicate in RAM.
+    // Level-0 and upper-layer payloads remain backed by a private, read-only
+    // file mapping. The pointer table, level table, and visited-list pool are
+    // the only per-index heap allocations. Do not call mutation APIs after
+    // using this loader.
+    void loadIndexReadOnlyMmap(const std::string &location, SpaceInterface<dist_t> *s) {
+#if !defined(__unix__) && !defined(__APPLE__)
+        (void) location;
+        (void) s;
+        throw std::runtime_error("Read-only mmap loading is unavailable on this platform");
+#else
+        std::ifstream input(location, std::ios::binary);
+        if (!input.is_open())
+            throw std::runtime_error("Cannot open file");
+
+        clear();
+        input.seekg(0, input.end);
+        const std::streampos total_filesize_pos = input.tellg();
+        if (total_filesize_pos <= 0)
+            throw std::runtime_error("Index file is empty");
+        const size_t total_filesize = static_cast<size_t>(total_filesize_pos);
+        input.seekg(0, input.beg);
+
+        readBinaryPOD(input, offsetLevel0_);
+        readBinaryPOD(input, max_elements_);
+        readBinaryPOD(input, cur_element_count);
+        max_elements_ = cur_element_count;
+        readBinaryPOD(input, size_data_per_element_);
+        readBinaryPOD(input, label_offset_);
+        readBinaryPOD(input, offsetData_);
+        readBinaryPOD(input, maxlevel_);
+        readBinaryPOD(input, enterpoint_node_);
+        readBinaryPOD(input, maxM_);
+        readBinaryPOD(input, maxM0_);
+        readBinaryPOD(input, M_);
+        readBinaryPOD(input, mult_);
+        readBinaryPOD(input, ef_construction_);
+        if (!input)
+            throw std::runtime_error("Index header is truncated");
+
+        data_size_ = s->get_data_size();
+        fstdistfunc_ = s->get_dist_func();
+        dist_func_param_ = s->get_dist_func_param();
+        const size_t level0_offset = static_cast<size_t>(input.tellg());
+        input.close();
+
+        const int fd = open(location.c_str(), O_RDONLY);
+        if (fd < 0)
+            throw std::runtime_error("Cannot open index for mmap");
+        void *mapping = mmap(nullptr, total_filesize, PROT_READ, MAP_PRIVATE, fd, 0);
+        close(fd);
+        if (mapping == MAP_FAILED)
+            throw std::runtime_error("Cannot mmap index");
+
+        read_only_mmap_base_ = mapping;
+        read_only_mmap_size_ = total_filesize;
+        read_only_mmap_ = true;
+
+        const size_t level0_bytes = cur_element_count * size_data_per_element_;
+        if (level0_offset > total_filesize ||
+                level0_bytes > total_filesize - level0_offset) {
+            clear();
+            throw std::runtime_error("Index level-0 payload is truncated");
+        }
+        data_level0_memory_ =
+            static_cast<char *>(mapping) + level0_offset;
+
+        size_links_per_element_ =
+            maxM_ * sizeof(tableint) + sizeof(linklistsizeint);
+        size_links_level0_ =
+            maxM0_ * sizeof(tableint) + sizeof(linklistsizeint);
+        revSize_ = 1.0 / mult_;
+        ef_ = 10;
+
+        linkLists_ = static_cast<char **>(
+            calloc(max_elements_, sizeof(char *)));
+        if (linkLists_ == nullptr) {
+            clear();
+            throw std::runtime_error(
+                "Not enough memory: mmap load failed to allocate link pointers");
+        }
+        try {
+            element_levels_.assign(max_elements_, 0);
+            visited_list_pool_.reset(new VisitedListPool(1, max_elements_));
+        } catch (...) {
+            clear();
+            throw;
+        }
+
+        const char *cursor =
+            static_cast<const char *>(mapping) + level0_offset + level0_bytes;
+        const char *const end =
+            static_cast<const char *>(mapping) + total_filesize;
+        for (size_t i = 0; i < cur_element_count; i++) {
+            if (static_cast<size_t>(end - cursor) < sizeof(unsigned int)) {
+                clear();
+                throw std::runtime_error("Index upper-layer table is truncated");
+            }
+            unsigned int link_list_size = 0;
+            memcpy(&link_list_size, cursor, sizeof(link_list_size));
+            cursor += sizeof(link_list_size);
+            if (static_cast<size_t>(end - cursor) < link_list_size ||
+                    (link_list_size != 0 &&
+                     link_list_size % size_links_per_element_ != 0)) {
+                clear();
+                throw std::runtime_error("Index upper-layer payload is invalid");
+            }
+            if (link_list_size != 0) {
+                element_levels_[i] =
+                    link_list_size / size_links_per_element_;
+                linkLists_[i] = const_cast<char *>(cursor);
+            }
+            cursor += link_list_size;
+        }
+        if (cursor != end) {
+            clear();
+            throw std::runtime_error("Index has trailing bytes");
+        }
+
+        num_deleted_ = 0;
+        for (size_t i = 0; i < cur_element_count; i++) {
+            if (isMarkedDeleted(i))
+                num_deleted_ += 1;
+        }
+#endif
     }
 
 

@@ -552,6 +552,17 @@ class TypedIndex {
       index_inited = true;
     }
 
+    void loadIndexReadOnlyMmap(const std::string &path_to_index) {
+      validateTypedMetadataForLoad(path_to_index);
+      std::unique_ptr<hnswlib::HierarchicalNSW<dist_t>> loaded(
+          new hnswlib::HierarchicalNSW<dist_t>(l2space));
+      loaded->loadIndexReadOnlyMmap(path_to_index, l2space);
+      delete appr_alg;
+      appr_alg = loaded.release();
+      cur_l = appr_alg->cur_element_count;
+      index_inited = true;
+    }
+
 
     void normalize_vector(float* data, float* norm_array) {
         float norm = 0.0f;
@@ -1232,6 +1243,12 @@ class Index {
         return int8_index->loadIndex(path_to_index, max_elements, allow_replace_deleted);
     }
 
+    void loadIndexReadOnlyMmap(const std::string &path_to_index) {
+        if (float_index) return float_index->loadIndexReadOnlyMmap(path_to_index);
+        if (uint8_index) return uint8_index->loadIndexReadOnlyMmap(path_to_index);
+        return int8_index->loadIndexReadOnlyMmap(path_to_index);
+    }
+
     void addItems(py::object input, py::object ids_ = py::none(), int num_threads = -1, bool replace_deleted = false) {
         if (float_index) return float_index->addItems(input, ids_, num_threads, replace_deleted);
         if (uint8_index) return uint8_index->addItems(input, ids_, num_threads, replace_deleted);
@@ -1626,6 +1643,9 @@ PYBIND11_PLUGIN(hnswlib) {
             py::arg("path_to_index"),
             py::arg("max_elements") = 0,
             py::arg("allow_replace_deleted") = false)
+        .def("load_index_readonly_mmap",
+            &Index::loadIndexReadOnlyMmap,
+            py::arg("path_to_index"))
         .def("mark_deleted", &Index::markDeleted, py::arg("label"))
         .def("unmark_deleted", &Index::unmarkDeleted, py::arg("label"))
         .def("resize_index", &Index::resizeIndex, py::arg("new_size"))
