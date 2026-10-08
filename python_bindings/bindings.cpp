@@ -392,6 +392,29 @@ class TypedIndex {
         this->num_threads_default = num_threads;
     }
 
+
+    void set_insert_concurrency(const std::string& mode) {
+        if (mode != "locked" && mode != "relaxed") {
+            throw std::invalid_argument("insert concurrency must be 'locked' or 'relaxed'");
+        }
+        require_index("set_insert_concurrency");
+        appr_alg->setRelaxedInserts(mode == "relaxed");
+    }
+
+
+    std::string get_insert_concurrency() const {
+        require_index("get_insert_concurrency");
+        return appr_alg->getRelaxedInserts() ? "relaxed" : "locked";
+    }
+
+
+    // The setting belongs to the HNSW graph, which init_index and load_index (re)create.
+    void require_index(const char* method) const {
+        if (!appr_alg) {
+            throw std::runtime_error(std::string(method) + " requires init_index or load_index first");
+        }
+    }
+
     size_t indexFileSize() const {
         return appr_alg->indexFileSize();
     }
@@ -1157,6 +1180,18 @@ class Index {
         return int8_index->set_num_threads(num_threads);
     }
 
+    void set_insert_concurrency(const std::string& mode) {
+        if (float_index) return float_index->set_insert_concurrency(mode);
+        if (uint8_index) return uint8_index->set_insert_concurrency(mode);
+        return int8_index->set_insert_concurrency(mode);
+    }
+
+    std::string get_insert_concurrency() const {
+        if (float_index) return float_index->get_insert_concurrency();
+        if (uint8_index) return uint8_index->get_insert_concurrency();
+        return int8_index->get_insert_concurrency();
+    }
+
     int get_num_threads() const {
         if (float_index) return float_index->num_threads_default;
         if (uint8_index) return uint8_index->num_threads_default;
@@ -1561,6 +1596,10 @@ PYBIND11_PLUGIN(hnswlib) {
         .def("get_ids_list", &Index::getIdsList)
         .def("set_ef", &Index::set_ef, py::arg("ef"))
         .def("set_num_threads", &Index::set_num_threads, py::arg("num_threads"))
+        .def("set_insert_concurrency", &Index::set_insert_concurrency, py::arg("mode"),
+             "'locked' (default) or 'relaxed': relaxed inserts skip per-element link-list locks. "
+             "Call after init_index/load_index; loading an index resets it to 'locked'.")
+        .def("get_insert_concurrency", &Index::get_insert_concurrency)
         .def("index_file_size", &Index::indexFileSize)
         .def("save_index", &Index::saveIndex, py::arg("path_to_index"))
         .def("load_index",
