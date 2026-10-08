@@ -67,6 +67,13 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 
     bool allow_replace_deleted_ = false;  // flag to replace deleted elements (marked as deleted) during insertions
 
+    // Relaxed inserts skip the per-element link-list locks while searching for neighbors and adding
+    // reverse links (also when re-adding an existing label), so concurrent insertions may overwrite
+    // each other's links (last writer wins).
+    // The lock on the element being inserted, the global lock for a new top level and the label
+    // locks are kept. Searches are unaffected; as always, they must not run concurrently with inserts.
+    bool relaxed_inserts_ = false;
+
     std::mutex deleted_elements_lock;  // lock for deleted_elements
     std::unordered_set<tableint> deleted_elements;  // contains internal ids of deleted elements
 
@@ -175,6 +182,25 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
     }
 
 
+    void setRelaxedInserts(bool relaxed) {
+        relaxed_inserts_ = relaxed;
+    }
+
+
+    bool getRelaxedInserts() const {
+        return relaxed_inserts_;
+    }
+
+
+    // Lock taken on another element's link lists during insertion; not acquired for relaxed inserts.
+    std::unique_lock<std::mutex> lockLinkListsForInsert(tableint internal_id) {
+        if (relaxed_inserts_) {
+            return std::unique_lock<std::mutex>(link_list_locks_[internal_id], std::defer_lock);
+        }
+        return std::unique_lock<std::mutex>(link_list_locks_[internal_id]);
+    }
+
+
     inline std::mutex& getLabelOpMutex(labeltype label) const {
         // calculate hash
         size_t lock_id = label & (MAX_LABEL_OPERATION_LOCKS - 1);
@@ -252,7 +278,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 
             tableint curNodeNum = curr_el_pair.second;
 
-            std::unique_lock <std::mutex> lock(link_list_locks_[curNodeNum]);
+            std::unique_lock <std::mutex> lock = lockLinkListsForInsert(curNodeNum);
 
             int *data;  // = (int *)(linkList0_ + curNodeNum * size_links_per_element0_);
             if (layer == 0) {
@@ -536,13 +562,16 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
             else
                 ll_cur = get_linklist(cur_c, level);
 
-            if (*ll_cur && !isUpdate) {
+            // A relaxed insert may already have linked to this element on this level (it is not
+            // locked against them); its list is overwritten here and that link is lost.
+            const bool expect_blank_list = !isUpdate && !relaxed_inserts_;
+            if (*ll_cur && expect_blank_list) {
                 throw std::runtime_error("The newly inserted element should have blank link list");
             }
             setListCount(ll_cur, selectedNeighbors.size());
             tableint *data = (tableint *) (ll_cur + 1);
             for (size_t idx = 0; idx < selectedNeighbors.size(); idx++) {
-                if (data[idx] && !isUpdate)
+                if (data[idx] && expect_blank_list)
                     throw std::runtime_error("Possible memory corruption");
                 if (level > element_levels_[selectedNeighbors[idx]])
                     throw std::runtime_error("Trying to make a link on a non-existent level");
@@ -552,7 +581,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         }
 
         for (size_t idx = 0; idx < selectedNeighbors.size(); idx++) {
-            std::unique_lock <std::mutex> lock(link_list_locks_[selectedNeighbors[idx]]);
+            std::unique_lock <std::mutex> lock = lockLinkListsForInsert(selectedNeighbors[idx]);
 
             linklistsizeint *ll_other;
             if (level == 0)
@@ -1217,7 +1246,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
                     while (changed) {
                         changed = false;
                         unsigned int *data;
-                        std::unique_lock <std::mutex> lock(link_list_locks_[currObj]);
+                        std::unique_lock <std::mutex> lock = lockLinkListsForInsert(currObj);
                         data = get_linklist(currObj, level);
                         int size = getListCount(data);
 
