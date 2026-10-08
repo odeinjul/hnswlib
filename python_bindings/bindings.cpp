@@ -1597,9 +1597,11 @@ PYBIND11_PLUGIN(hnswlib) {
         .def("set_ef", &Index::set_ef, py::arg("ef"))
         .def("set_num_threads", &Index::set_num_threads, py::arg("num_threads"))
         .def("set_insert_concurrency", &Index::set_insert_concurrency, py::arg("mode"),
-             "'locked' (default) or 'relaxed': relaxed inserts skip per-element link-list locks. "
-             "Call after init_index/load_index; loading an index resets it to 'locked'.")
-        .def("get_insert_concurrency", &Index::get_insert_concurrency)
+             "'locked' (default) or 'relaxed': relaxed inserts skip per-element link-list locks, so "
+             "concurrent inserts may lose links. Set it after init_index/load_index (which, like "
+             "unpickling, reset it to 'locked') and not while add_items is running.")
+        .def("get_insert_concurrency", &Index::get_insert_concurrency,
+             "Current insert concurrency mode: 'locked' or 'relaxed'.")
         .def("index_file_size", &Index::indexFileSize)
         .def("save_index", &Index::saveIndex, py::arg("path_to_index"))
         .def("load_index",

@@ -103,6 +103,7 @@ For other spaces use the nmslib library https://github.com/nmslib/nmslib.
     * For `dtype='uint8'` and `dtype='int8'`, this also writes `<path_to_index>.hnswmeta.json`.
 
 * `set_num_threads(num_threads)` set the default number of cpu threads used during data insertion/querying.
+* `set_insert_concurrency(mode)` - `'locked'` (default) or `'relaxed'`. Relaxed inserts skip the per-element link-list locks, so concurrent `add_items` threads may overwrite each other's links and leave some elements unreachable; useful for studying the cost of concurrency control. Set it after `init_index`/`load_index` and not during `add_items`. `get_insert_concurrency()` returns the mode.
   
 * `get_items(ids, return_type = 'numpy')` - returns a numpy array (shape:`N*dim`) of vectors that have integer identifiers specified in `ids` numpy vector (shape:`N`) if `return_type` is `list` return list of lists. Note that for cosine similarity it currently returns **normalized** vectors.
   

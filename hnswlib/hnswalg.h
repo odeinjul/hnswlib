@@ -67,11 +67,14 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 
     bool allow_replace_deleted_ = false;  // flag to replace deleted elements (marked as deleted) during insertions
 
-    // Relaxed inserts skip the per-element link-list locks while searching for neighbors and adding
-    // reverse links (also when re-adding an existing label), so concurrent insertions may overwrite
-    // each other's links (last writer wins).
-    // The lock on the element being inserted, the global lock for a new top level and the label
-    // locks are kept. Searches are unaffected; as always, they must not run concurrently with inserts.
+    // Relaxed inserts of new elements skip the per-element link-list locks while searching for
+    // neighbors and adding reverse links, so concurrent insertions may overwrite each other's links
+    // (last writer wins) and a just-inserted element can end up unreachable. The global lock for a
+    // new top level and the label locks are kept; the inserting element's own lock is still taken
+    // but no relaxed insert waits for it. Re-adding an existing label (updatePoint) is only partly
+    // relaxed; do not mix it with relaxed inserts.
+    // Searches are unaffected and, as always, must not run concurrently with inserts. Unlocked list
+    // accesses are formally data races; they rely on aligned 2- and 4-byte stores being atomic.
     bool relaxed_inserts_ = false;
 
     std::mutex deleted_elements_lock;  // lock for deleted_elements
@@ -192,6 +195,21 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
     }
 
 
+    // Sets a list's count after its ids are written, so an unlocked (relaxed) reader sees either the
+    // previous count or fully written ids.
+    void publishListCount(linklistsizeint *list, unsigned short int size) const {
+        std::atomic_thread_fence(std::memory_order_release);
+        setListCount(list, size);
+    }
+
+
+    // A relaxed insert can still read a slot of a list that is being rewritten; skip ids that are
+    // not yet allocated or do not have the searched layer.
+    bool isLinkableForInsert(tableint id, int layer) const {
+        return !relaxed_inserts_ || (id < cur_element_count && element_levels_[id] >= layer);
+    }
+
+
     // Lock taken on another element's link lists during insertion; not acquired for relaxed inserts.
     std::unique_lock<std::mutex> lockLinkListsForInsert(tableint internal_id) {
         if (relaxed_inserts_) {
@@ -303,6 +321,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
                 _mm_prefetch((char *) (visited_array + *(datal + j + 1)), _MM_HINT_T0);
                 _mm_prefetch(getDataByInternalId(*(datal + j + 1)), _MM_HINT_T0);
 #endif
+                if (!isLinkableForInsert(candidate_id, layer)) continue;
                 if (visited_array[candidate_id] == visited_array_tag) continue;
                 visited_array[candidate_id] = visited_array_tag;
                 char *currObj1 = (getDataByInternalId(candidate_id));
@@ -568,7 +587,6 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
             if (*ll_cur && expect_blank_list) {
                 throw std::runtime_error("The newly inserted element should have blank link list");
             }
-            setListCount(ll_cur, selectedNeighbors.size());
             tableint *data = (tableint *) (ll_cur + 1);
             for (size_t idx = 0; idx < selectedNeighbors.size(); idx++) {
                 if (data[idx] && expect_blank_list)
@@ -578,6 +596,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 
                 data[idx] = selectedNeighbors[idx];
             }
+            publishListCount(ll_cur, selectedNeighbors.size());
         }
 
         for (size_t idx = 0; idx < selectedNeighbors.size(); idx++) {
@@ -614,7 +633,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
             if (!is_cur_c_present) {
                 if (sz_link_list_other < Mcurmax) {
                     data[sz_link_list_other] = cur_c;
-                    setListCount(ll_other, sz_link_list_other + 1);
+                    publishListCount(ll_other, sz_link_list_other + 1);
                 } else {
                     // finding the "weakest" element to replace it with the new one
                     dist_t d_max = fstdistfunc_(getDataByInternalId(cur_c), getDataByInternalId(selectedNeighbors[idx]),
@@ -638,7 +657,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
                         indx++;
                     }
 
-                    setListCount(ll_other, indx);
+                    publishListCount(ll_other, indx);
                     // Nearest K:
                     /*int indx = -1;
                     for (int j = 0; j < sz_link_list_other; j++) {
@@ -1255,6 +1274,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
                             tableint cand = datal[i];
                             if (cand < 0 || cand > max_elements_)
                                 throw std::runtime_error("cand error");
+                            if (!isLinkableForInsert(cand, level)) continue;
                             dist_t d = fstdistfunc_(data_point, getDataByInternalId(cand), dist_func_param_);
                             if (d < curdist) {
                                 curdist = d;
