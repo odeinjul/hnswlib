@@ -104,6 +104,7 @@ For other spaces use the nmslib library https://github.com/nmslib/nmslib.
 
 * `set_num_threads(num_threads)` set the default number of cpu threads used during data insertion/querying.
 * `set_insert_concurrency(mode)` - `'locked'` (default) or `'relaxed'`. Relaxed inserts skip the per-element link-list locks, so concurrent `add_items` threads may overwrite each other's links and leave some elements unreachable; useful for studying the cost of concurrency control. Set it after `init_index`/`load_index` and not during `add_items`. `get_insert_concurrency()` returns the mode.
+* `set_insert_link_order(order)` - `'per-level'` (default) or `'own-lists-first'`. By default a new element is linked one level at a time, so a concurrent relaxed insert can reach it from an upper level while its level-0 list is still empty, link only to it, and lose that link when the list is written. `'own-lists-first'` writes the element's lists on every level before any reverse link, which avoids this. Set it after `init_index`/`load_index` and not during `add_items`. `get_insert_link_order()` returns the order.
   
 * `get_items(ids, return_type = 'numpy')` - returns a numpy array (shape:`N*dim`) of vectors that have integer identifiers specified in `ids` numpy vector (shape:`N`) if `return_type` is `list` return list of lists. Note that for cosine similarity it currently returns **normalized** vectors.
   
