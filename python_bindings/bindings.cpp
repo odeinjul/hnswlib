@@ -408,6 +408,21 @@ class TypedIndex {
     }
 
 
+    void set_insert_link_order(const std::string& order) {
+        if (order != "per-level" && order != "own-lists-first") {
+            throw std::invalid_argument("insert link order must be 'per-level' or 'own-lists-first'");
+        }
+        require_index("set_insert_link_order");
+        appr_alg->setOwnListsFirst(order == "own-lists-first");
+    }
+
+
+    std::string get_insert_link_order() const {
+        require_index("get_insert_link_order");
+        return appr_alg->getOwnListsFirst() ? "own-lists-first" : "per-level";
+    }
+
+
     // The setting belongs to the HNSW graph, which init_index and load_index (re)create.
     void require_index(const char* method) const {
         if (!appr_alg) {
@@ -1192,6 +1207,18 @@ class Index {
         return int8_index->get_insert_concurrency();
     }
 
+    void set_insert_link_order(const std::string& order) {
+        if (float_index) return float_index->set_insert_link_order(order);
+        if (uint8_index) return uint8_index->set_insert_link_order(order);
+        return int8_index->set_insert_link_order(order);
+    }
+
+    std::string get_insert_link_order() const {
+        if (float_index) return float_index->get_insert_link_order();
+        if (uint8_index) return uint8_index->get_insert_link_order();
+        return int8_index->get_insert_link_order();
+    }
+
     int get_num_threads() const {
         if (float_index) return float_index->num_threads_default;
         if (uint8_index) return uint8_index->num_threads_default;
@@ -1602,6 +1629,13 @@ PYBIND11_PLUGIN(hnswlib) {
              "unpickling, reset it to 'locked') and not while add_items is running.")
         .def("get_insert_concurrency", &Index::get_insert_concurrency,
              "Current insert concurrency mode: 'locked' or 'relaxed'.")
+        .def("set_insert_link_order", &Index::set_insert_link_order, py::arg("order"),
+             "'per-level' (default) or 'own-lists-first': own-lists-first writes a new element's lists "
+             "on every level before any reverse link, so a concurrent relaxed insert cannot reach it "
+             "while a lower list is still empty. Set it after init_index/load_index (which, like "
+             "unpickling, reset it to 'per-level') and not while add_items is running.")
+        .def("get_insert_link_order", &Index::get_insert_link_order,
+             "Current insert link order: 'per-level' or 'own-lists-first'.")
         .def("index_file_size", &Index::indexFileSize)
         .def("save_index", &Index::saveIndex, py::arg("path_to_index"))
         .def("load_index",
