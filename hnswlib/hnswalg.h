@@ -548,13 +548,9 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
     }
 
 
-    tableint mutuallyConnectNewElement(
-        const void *data_point,
-        tableint cur_c,
-        std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst> &top_candidates,
-        int level,
-        bool isUpdate) {
-        size_t Mcurmax = level ? maxM_ : maxM0_;
+    // Neighbors of a new element on one level, chosen by the heuristic; the last one is the closest.
+    std::vector<tableint> selectNewElementNeighbors(
+        std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst> &top_candidates) {
         getNeighborsByHeuristic2(top_candidates, M_);
         if (top_candidates.size() > M_)
             throw std::runtime_error("Should be not be more than M_ candidates returned by the heuristic");
@@ -565,9 +561,25 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
             selectedNeighbors.push_back(top_candidates.top().second);
             top_candidates.pop();
         }
+        return selectedNeighbors;
+    }
 
-        tableint next_closest_entry_point = selectedNeighbors.back();
 
+    tableint mutuallyConnectNewElement(
+        const void *data_point,
+        tableint cur_c,
+        std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst> &top_candidates,
+        int level,
+        bool isUpdate) {
+        std::vector<tableint> selectedNeighbors = selectNewElementNeighbors(top_candidates);
+        writeNewElementList(cur_c, selectedNeighbors, level, isUpdate);
+        linkBackToNewElement(cur_c, selectedNeighbors, level, isUpdate);
+        return selectedNeighbors.back();
+    }
+
+
+    // Writes the new element's own list on one level.
+    void writeNewElementList(tableint cur_c, const std::vector<tableint> &selectedNeighbors, int level, bool isUpdate) {
         {
             // lock only during the update
             // because during the addition the lock for cur_c is already acquired
@@ -581,8 +593,8 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
             else
                 ll_cur = get_linklist(cur_c, level);
 
-            // A relaxed insert may already have linked to this element on this level (it is not
-            // locked against them); its list is overwritten here and that link is lost.
+            // addPoint writes every own list before any back-link, so no insert can have linked to
+            // the element yet; relaxed updates are not locked against inserts, so they are not checked.
             const bool expect_blank_list = !isUpdate && !relaxed_inserts_;
             if (*ll_cur && expect_blank_list) {
                 throw std::runtime_error("The newly inserted element should have blank link list");
@@ -598,7 +610,12 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
             }
             publishListCount(ll_cur, selectedNeighbors.size());
         }
+    }
 
+
+    // Adds the new element to the lists of its selected neighbors on one level.
+    void linkBackToNewElement(tableint cur_c, const std::vector<tableint> &selectedNeighbors, int level, bool isUpdate) {
+        size_t Mcurmax = level ? maxM_ : maxM0_;
         for (size_t idx = 0; idx < selectedNeighbors.size(); idx++) {
             std::unique_lock <std::mutex> lock = lockLinkListsForInsert(selectedNeighbors[idx]);
 
@@ -673,8 +690,6 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
                 }
             }
         }
-
-        return next_closest_entry_point;
     }
 
 
@@ -1287,6 +1302,9 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
             }
 
             bool epDeleted = isMarkedDeleted(enterpoint_copy);
+            // Write the element's own list on every level before any neighbor links back to it, so no
+            // concurrent insert can reach it while a lower list is still empty (and later overwritten).
+            std::vector<std::pair<int, std::vector<tableint>>> selected_by_level;
             for (int level = std::min(curlevel, maxlevelcopy); level >= 0; level--) {
                 if (level > maxlevelcopy || level < 0)  // possible?
                     throw std::runtime_error("Level error");
@@ -1298,7 +1316,13 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
                     if (top_candidates.size() > ef_construction_)
                         top_candidates.pop();
                 }
-                currObj = mutuallyConnectNewElement(data_point, cur_c, top_candidates, level, false);
+                std::vector<tableint> selected = selectNewElementNeighbors(top_candidates);
+                currObj = selected.back();
+                writeNewElementList(cur_c, selected, level, false);
+                selected_by_level.emplace_back(level, std::move(selected));
+            }
+            for (const auto &level_selected : selected_by_level) {
+                linkBackToNewElement(cur_c, level_selected.second, level_selected.first, false);
             }
         } else {
             // Do nothing for the first element
