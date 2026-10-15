@@ -393,6 +393,12 @@ class TypedIndex {
     }
 
 
+    void set_ef_construction(size_t ef_construction) {
+        require_index("set_ef_construction");
+        appr_alg->setEfConstruction(ef_construction);
+    }
+
+
     void set_insert_concurrency(const std::string& mode) {
         if (mode != "locked" && mode != "relaxed") {
             throw std::invalid_argument("insert concurrency must be 'locked' or 'relaxed'");
@@ -420,6 +426,18 @@ class TypedIndex {
     std::string get_insert_link_order() const {
         require_index("get_insert_link_order");
         return appr_alg->getOwnListsFirst() ? "own-lists-first" : "per-level";
+    }
+
+
+    void set_prune_detour_check(bool prune_detour_check) {
+        require_index("set_prune_detour_check");
+        appr_alg->setPruneDetourCheck(prune_detour_check);
+    }
+
+
+    bool get_prune_detour_check() const {
+        require_index("get_prune_detour_check");
+        return appr_alg->getPruneDetourCheck();
     }
 
 
@@ -1195,6 +1213,12 @@ class Index {
         return int8_index->set_num_threads(num_threads);
     }
 
+    void set_ef_construction(size_t ef_construction) {
+        if (float_index) return float_index->set_ef_construction(ef_construction);
+        if (uint8_index) return uint8_index->set_ef_construction(ef_construction);
+        return int8_index->set_ef_construction(ef_construction);
+    }
+
     void set_insert_concurrency(const std::string& mode) {
         if (float_index) return float_index->set_insert_concurrency(mode);
         if (uint8_index) return uint8_index->set_insert_concurrency(mode);
@@ -1217,6 +1241,38 @@ class Index {
         if (float_index) return float_index->get_insert_link_order();
         if (uint8_index) return uint8_index->get_insert_link_order();
         return int8_index->get_insert_link_order();
+    }
+
+    void set_prune_detour_check(bool prune_detour_check) {
+        if (float_index) return float_index->set_prune_detour_check(prune_detour_check);
+        if (uint8_index) return uint8_index->set_prune_detour_check(prune_detour_check);
+        return int8_index->set_prune_detour_check(prune_detour_check);
+    }
+
+    bool get_prune_detour_check() const {
+        if (float_index) return float_index->get_prune_detour_check();
+        if (uint8_index) return uint8_index->get_prune_detour_check();
+        return int8_index->get_prune_detour_check();
+    }
+
+    static py::dict get_prune_detour_stats() {
+        const hnswlib::PruneDetourStats &stats = hnswlib::pruneDetourStats();
+        return py::dict(
+            "prunes"_a = stats.prunes.load(),
+            "prunes_with_drops"_a = stats.prunes_with_drops.load(),
+            "dropped_old"_a = stats.dropped_old.load(),
+            "verified"_a = stats.verified.load(),
+            "refilled"_a = stats.refilled.load(),
+            "swapped"_a = stats.swapped.load(),
+            "left_unchanged"_a = stats.left_unchanged.load(),
+            "rescue_needed"_a = stats.rescue_needed.load(),
+            "rescue_linked"_a = stats.rescue_linked.load(),
+            "rescue_failed"_a = stats.rescue_failed.load(),
+            "witness_busy"_a = stats.witness_busy.load());
+    }
+
+    static void reset_prune_detour_stats() {
+        hnswlib::pruneDetourStats().reset();
     }
 
     int get_num_threads() const {
@@ -1623,6 +1679,10 @@ PYBIND11_PLUGIN(hnswlib) {
         .def("get_ids_list", &Index::getIdsList)
         .def("set_ef", &Index::set_ef, py::arg("ef"))
         .def("set_num_threads", &Index::set_num_threads, py::arg("num_threads"))
+        .def("set_ef_construction", &Index::set_ef_construction, py::arg("ef_construction"),
+             "Sets the search width of later inserts (at least M), for example on a loaded index, "
+             "which otherwise keeps the ef_construction it was built with. The ef_construction "
+             "property returns it.")
         .def("set_insert_concurrency", &Index::set_insert_concurrency, py::arg("mode"),
              "'locked' (default) or 'relaxed': relaxed inserts skip per-element link-list locks, so "
              "concurrent inserts may lose links. Set it after init_index/load_index (which, like "
@@ -1636,6 +1696,21 @@ PYBIND11_PLUGIN(hnswlib) {
              "unpickling, reset it to 'per-level') and not while add_items is running.")
         .def("get_insert_link_order", &Index::get_insert_link_order,
              "Current insert link order: 'per-level' or 'own-lists-first'.")
+        .def("set_prune_detour_check", &Index::set_prune_detour_check, py::arg("enabled"),
+             "Off by default. When on, a back-link of a new element to a full level-0 list drops an "
+             "old entry z only if a kept entry's list holds z (a detour); otherwise free slots are "
+             "refilled, entries are swapped, or the list is left unchanged. A new element left "
+             "without any level-0 back-link is then linked into its nearest searched elements under "
+             "the same rule. Set it after init_index/load_index (which, like unpickling, turn it off) "
+             "and not while add_items is running.")
+        .def("get_prune_detour_check", &Index::get_prune_detour_check,
+             "Whether the detour-checked level-0 prune is on.")
+        .def_static("get_prune_detour_stats", &Index::get_prune_detour_stats,
+             "Counters of the detour-checked prune, shared by all indexes of the process: prunes, "
+             "prunes_with_drops, dropped_old, verified, refilled, swapped, left_unchanged, "
+             "rescue_needed, rescue_linked, rescue_failed, witness_busy.")
+        .def_static("reset_prune_detour_stats", &Index::reset_prune_detour_stats,
+             "Sets the process-wide detour-check counters to zero.")
         .def("index_file_size", &Index::indexFileSize)
         .def("save_index", &Index::saveIndex, py::arg("path_to_index"))
         .def("load_index",
