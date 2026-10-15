@@ -2,7 +2,9 @@
 
 #include "visited_list_pool.h"
 #include "hnswlib.h"
+#include <algorithm>
 #include <atomic>
+#include <initializer_list>
 #include <random>
 #include <stdlib.h>
 #include <assert.h>
@@ -13,6 +15,34 @@
 namespace hnswlib {
 typedef unsigned int tableint;
 typedef unsigned int linklistsizeint;
+
+// Counters of the detour-checked layer-0 prune (HierarchicalNSW::setPruneDetourCheck), shared by
+// every index in the process. They count only while the check is on.
+struct PruneDetourStats {
+    std::atomic<uint64_t> prunes{0};             // full-list re-prunes of a back-link
+    std::atomic<uint64_t> prunes_with_drops{0};  // ... where the heuristic dropped an old entry
+    std::atomic<uint64_t> dropped_old{0};        // old entries the heuristic dropped
+    std::atomic<uint64_t> verified{0};           // ... that a kept entry's list already holds
+    std::atomic<uint64_t> refilled{0};           // unverified drops put back into free slots
+    std::atomic<uint64_t> swapped{0};            // unverified drops swapped in for a verified entry
+    std::atomic<uint64_t> left_unchanged{0};     // prunes reverted: the list keeps its entries
+    std::atomic<uint64_t> rescue_needed{0};      // inserts left without any layer-0 back-link
+    std::atomic<uint64_t> rescue_linked{0};      // ... then linked into a searched element
+    std::atomic<uint64_t> rescue_failed{0};      // ... that stayed without one
+
+    void reset() {
+        for (std::atomic<uint64_t> *counter : {&prunes, &prunes_with_drops, &dropped_old, &verified,
+                                               &refilled, &swapped, &left_unchanged, &rescue_needed,
+                                               &rescue_linked, &rescue_failed}) {
+            counter->store(0);
+        }
+    }
+};
+
+inline PruneDetourStats &pruneDetourStats() {
+    static PruneDetourStats stats;
+    return stats;
+}
 
 template<typename dist_t>
 class HierarchicalNSW : public AlgorithmInterface<dist_t> {
@@ -84,6 +114,14 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
     // link when the element writes its lower list. Own-lists-first writes the element's lists on
     // every level before any reverse link, so no insert can reach it before its lists exist.
     bool own_lists_first_ = false;
+
+    // Detour-checked layer-0 prune for new elements (off by default). When a back-link to a full
+    // layer-0 list u triggers the heuristic re-prune, an old entry z is dropped only if the list
+    // of some kept entry s holds z, so the path u -> s -> z remains (see pruneWithDetourCheck).
+    // A new element that gets no layer-0 back-link is then force-linked into the nearest searched
+    // elements under the same rule. Upper levels and updates of existing elements are unchanged.
+    bool prune_detour_check_ = false;
+    static const size_t PRUNE_DETOUR_RESCUE_TARGETS = 16;
 
     std::mutex deleted_elements_lock;  // lock for deleted_elements
     std::unordered_set<tableint> deleted_elements;  // contains internal ids of deleted elements
@@ -217,6 +255,16 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 
     bool getOwnListsFirst() const {
         return own_lists_first_;
+    }
+
+
+    void setPruneDetourCheck(bool prune_detour_check) {
+        prune_detour_check_ = prune_detour_check;
+    }
+
+
+    bool getPruneDetourCheck() const {
+        return prune_detour_check_;
     }
 
 
@@ -596,10 +644,34 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst> &top_candidates,
         int level,
         bool isUpdate) {
+        const bool detour_check = detourCheckApplies(level, isUpdate);
+        std::vector<std::pair<dist_t, tableint>> rescue_candidates;
+        if (detour_check)
+            rescue_candidates = nearestFirst(top_candidates);
         std::vector<tableint> selectedNeighbors = selectNewElementNeighbors(top_candidates);
         writeNewElementList(cur_c, selectedNeighbors, level, isUpdate);
-        linkBackToNewElement(cur_c, selectedNeighbors, level, isUpdate);
+        size_t linked = linkBackToNewElement(cur_c, selectedNeighbors, level, isUpdate);
+        if (detour_check && !linked)
+            rescueNewElement(cur_c, selectedNeighbors, rescue_candidates);
         return selectedNeighbors.back();
+    }
+
+
+    // The detour-checked prune applies to the layer-0 links of new elements only.
+    bool detourCheckApplies(int level, bool isUpdate) const {
+        return prune_detour_check_ && level == 0 && !isUpdate;
+    }
+
+
+    // Copy of a candidate queue, nearest first.
+    static std::vector<std::pair<dist_t, tableint>> nearestFirst(
+        std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst> candidates) {
+        std::vector<std::pair<dist_t, tableint>> sorted(candidates.size());
+        for (size_t i = sorted.size(); i > 0; i--) {
+            sorted[i - 1] = candidates.top();
+            candidates.pop();
+        }
+        return sorted;
     }
 
 
@@ -638,9 +710,12 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
     }
 
 
-    // Adds the new element to the lists of its selected neighbors on one level.
-    void linkBackToNewElement(tableint cur_c, const std::vector<tableint> &selectedNeighbors, int level, bool isUpdate) {
+    // Adds the new element to the lists of its selected neighbors on one level. Returns the number
+    // of these lists that hold it afterwards.
+    size_t linkBackToNewElement(tableint cur_c, const std::vector<tableint> &selectedNeighbors, int level, bool isUpdate) {
         size_t Mcurmax = level ? maxM_ : maxM0_;
+        const bool detour_check = detourCheckApplies(level, isUpdate);
+        size_t linked = 0;
         for (size_t idx = 0; idx < selectedNeighbors.size(); idx++) {
             std::unique_lock <std::mutex> lock = lockLinkListsForInsert(selectedNeighbors[idx]);
 
@@ -672,10 +747,16 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
             }
 
             // If cur_c is already present in the neighboring connections of `selectedNeighbors[idx]` then no need to modify any connections or run the heuristics.
-            if (!is_cur_c_present) {
+            if (is_cur_c_present) {
+                linked++;
+            } else {
                 if (sz_link_list_other < Mcurmax) {
                     data[sz_link_list_other] = cur_c;
                     publishListCount(ll_other, sz_link_list_other + 1);
+                    linked++;
+                } else if (detour_check) {
+                    if (pruneWithDetourCheck(selectedNeighbors[idx], cur_c, false))
+                        linked++;
                 } else {
                     // finding the "weakest" element to replace it with the new one
                     dist_t d_max = fstdistfunc_(getDataByInternalId(cur_c), getDataByInternalId(selectedNeighbors[idx]),
@@ -695,6 +776,8 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
                     int indx = 0;
                     while (candidates.size() > 0) {
                         data[indx] = candidates.top().second;
+                        if (data[indx] == cur_c)
+                            linked++;
                         candidates.pop();
                         indx++;
                     }
@@ -715,6 +798,261 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
                 }
             }
         }
+        return linked;
+    }
+
+
+    // Re-prunes the full layer-0 list of u for the new element cur_c; the caller holds u's lock.
+    //  1. The heuristic, as in the normal prune, gives the kept set K; the other entries are dropped.
+    //  2. A dropped old entry z is verified if the layer-0 list of some s in K (s != z) holds z, so
+    //     u -> s -> z replaces u -> z. If cur_c is kept, its own list (already written) counts.
+    //  3. Free slots, when the heuristic kept fewer than maxM0_, are refilled with unverified
+    //     drops, closest to u first.
+    //  4. Each remaining unverified drop is swapped in for a kept old entry y, farthest from u
+    //     first, such that y and every verified drop stay verified by the new kept set.
+    //  5. If unverified drops remain, u's list is left unchanged and cur_c is not added.
+    // With `rescue`, cur_c must be kept: it is placed before any unverified drop, is never swapped
+    // out, and the back-link counters are not updated. Returns whether u's list holds cur_c.
+    //
+    // The lists of other elements are read without their locks, and an entry still counts as a
+    // witness when its list changes right after the read: every id read from s's list was an
+    // edge s -> z at some time, and with the check on (locked inserts) every later removal of
+    // s -> z is itself verified, so a path s ~> z, and with it u ~> z, remains. Not covered are
+    // concurrent prunes that verify the same entry through each other (u drops z because s holds
+    // it while s drops z because u holds it), and relaxed inserts, which overwrite lists unchecked.
+    bool pruneWithDetourCheck(tableint u, tableint cur_c, bool rescue) {
+        const size_t Mcurmax = maxM0_;
+        linklistsizeint *ll_u = get_linklist0(u);
+        tableint *data = (tableint *) (ll_u + 1);
+        const size_t old_count = getListCount(ll_u);
+        const size_t n = old_count + 1;  // entries: the old list, then cur_c
+        const size_t cur = old_count;
+        std::vector<tableint> ids(data, data + old_count);
+        ids.push_back(cur_c);
+
+        // Entry index by element id (open addressing). A duplicate id should not occur under
+        // locks; then the list is left as it is.
+        size_t table_size = 16;
+        while (table_size < 4 * n)
+            table_size <<= 1;
+        std::vector<int> table(table_size, -1);
+        auto first_slot = [&](tableint id) { return (size_t) (id * 2654435761u) & (table_size - 1); };
+        auto find = [&](tableint id) {
+            for (size_t s = first_slot(id);; s = (s + 1) & (table_size - 1)) {
+                if (table[s] < 0 || ids[table[s]] == id)
+                    return table[s];
+            }
+        };
+        bool ok = true;
+        for (size_t i = 0; i < n && ok; i++) {
+            size_t s = first_slot(ids[i]);
+            while (table[s] >= 0 && ids[table[s]] != ids[i])
+                s = (s + 1) & (table_size - 1);
+            ok = table[s] < 0;
+            if (ok)
+                table[s] = (int) i;
+        }
+
+        // 1. The normal heuristic, on the same queue as the normal prune.
+        std::vector<dist_t> dist(n);
+        std::vector<char> in_k(n, 0);
+        std::vector<size_t> kept;  // heuristic output order: farthest from u first
+        std::vector<size_t> dropped;  // old entries
+        if (ok) {
+            std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst> candidates;
+            dist[cur] = fstdistfunc_(getDataByInternalId(cur_c), getDataByInternalId(u), dist_func_param_);
+            candidates.emplace(dist[cur], cur_c);
+            for (size_t j = 0; j < old_count; j++) {
+                dist[j] = fstdistfunc_(getDataByInternalId(ids[j]), getDataByInternalId(u), dist_func_param_);
+                candidates.emplace(dist[j], ids[j]);
+            }
+            getNeighborsByHeuristic2(candidates, Mcurmax);
+            while (!candidates.empty()) {
+                size_t j = find(candidates.top().second);
+                candidates.pop();
+                in_k[j] = 1;
+                kept.push_back(j);
+            }
+            for (size_t z = 0; z < old_count; z++) {
+                if (!in_k[z])
+                    dropped.push_back(z);
+            }
+        }
+        const std::vector<char> heuristic_k = in_k;
+
+        // 2. member[i * n + j]: the layer-0 list of entry j holds entry i. Lists are read lazily.
+        std::vector<char> member(n * n, 0);
+        std::vector<char> list_read(n, 0);
+        auto read_list = [&](size_t j) {
+            if (list_read[j])
+                return;
+            list_read[j] = 1;
+            linklistsizeint *ll = get_linklist0(ids[j]);
+            size_t count = std::min((size_t) getListCount(ll), maxM0_);
+            const tableint *links = (const tableint *) (ll + 1);
+            for (size_t k = 0; k < count; k++) {
+                int i = find(links[k]);
+                if (i >= 0 && (size_t) i != j)
+                    member[i * n + j] = 1;
+            }
+        };
+        std::vector<int> witnesses(n, 0);  // kept entries other than i whose list holds i
+        size_t unverified = dropped.size();
+        for (size_t idx = 0; idx < kept.size() && unverified; idx++) {
+            read_list(kept[idx]);
+            for (size_t z : dropped) {
+                if (member[z * n + kept[idx]] && witnesses[z]++ == 0)
+                    unverified--;
+            }
+        }
+        const size_t verified = dropped.size() - unverified;
+
+        size_t refilled = 0, swapped = 0;
+        if (ok && (unverified || (rescue && !in_k[cur]))) {
+            for (size_t j = 0; j < n; j++)
+                read_list(j);
+            std::fill(witnesses.begin(), witnesses.end(), 0);
+            for (size_t j = 0; j < n; j++) {
+                if (!in_k[j])
+                    continue;
+                for (size_t i = 0; i < n; i++)
+                    witnesses[i] += member[i * n + j];
+            }
+            auto set_kept = [&](size_t j, bool keep) {
+                in_k[j] = keep;
+                for (size_t i = 0; i < n; i++)
+                    witnesses[i] += keep ? member[i * n + j] : -member[i * n + j];
+            };
+            // The forced cur_c first, then the unverified drop closest to u; -1 if none is left.
+            auto next_unverified = [&]() {
+                if (rescue && !in_k[cur])
+                    return (int) cur;
+                int best = -1;
+                for (size_t z = 0; z < old_count; z++) {
+                    if (!in_k[z] && !witnesses[z] && (best < 0 || dist[z] < dist[best]))
+                        best = (int) z;
+                }
+                return best;
+            };
+
+            // 3. Refill free slots.
+            size_t kept_count = kept.size();
+            int w;
+            while (kept_count < Mcurmax && (w = next_unverified()) >= 0) {
+                set_kept(w, true);
+                kept_count++;
+                if ((size_t) w != cur)
+                    refilled++;
+            }
+
+            // 4. Swap the rest in for verified kept entries.
+            while (ok && (w = next_unverified()) >= 0) {
+                std::vector<size_t> victims;
+                for (size_t y = 0; y < old_count; y++) {
+                    if (in_k[y])
+                        victims.push_back(y);
+                }
+                std::sort(victims.begin(), victims.end(), [&](size_t a, size_t b) { return dist[a] > dist[b]; });
+                int victim = -1;
+                for (size_t y : victims) {
+                    if (!witnesses[y] && !member[y * n + w])
+                        continue;  // y would be dropped unverified
+                    bool keeps_verified = true;
+                    for (size_t z = 0; z < old_count && keeps_verified; z++) {
+                        if (in_k[z] || z == y || !witnesses[z])
+                            continue;  // kept, the victim, or still unverified
+                        keeps_verified = witnesses[z] - member[z * n + y] + member[z * n + w] > 0;
+                    }
+                    if (keeps_verified) {
+                        victim = (int) y;
+                        break;
+                    }
+                }
+                if (victim < 0) {
+                    ok = false;  // 5. leave u's list unchanged
+                } else {
+                    set_kept(victim, false);
+                    set_kept(w, true);
+                    swapped++;
+                }
+            }
+        }
+
+        if (ok) {
+            // Farthest from u first, as the normal prune writes it.
+            std::vector<size_t> order;
+            for (size_t j : kept) {
+                if (in_k[j])
+                    order.push_back(j);
+            }
+            for (size_t j = 0; j < n; j++) {
+                if (in_k[j] && !heuristic_k[j])
+                    order.push_back(j);
+            }
+            std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) { return dist[a] > dist[b]; });
+            for (size_t idx = 0; idx < order.size(); idx++)
+                data[idx] = ids[order[idx]];
+            publishListCount(ll_u, order.size());
+        }
+
+        if (!rescue) {
+            PruneDetourStats &stats = pruneDetourStats();
+            stats.prunes.fetch_add(1, std::memory_order_relaxed);
+            if (!dropped.empty())
+                stats.prunes_with_drops.fetch_add(1, std::memory_order_relaxed);
+            stats.dropped_old.fetch_add(dropped.size(), std::memory_order_relaxed);
+            stats.verified.fetch_add(verified, std::memory_order_relaxed);
+            if (ok) {
+                stats.refilled.fetch_add(refilled, std::memory_order_relaxed);
+                stats.swapped.fetch_add(swapped, std::memory_order_relaxed);
+            } else {
+                stats.left_unchanged.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        return ok && in_k[cur];
+    }
+
+
+    // A new element whose layer-0 back-links were all refused has no layer-0 in-edge. Link it into
+    // the nearest searched elements, its selected neighbors first: append it to a list with a free
+    // slot, or re-prune a full list with it kept (pruneWithDetourCheck with rescue), trying at most
+    // PRUNE_DETOUR_RESCUE_TARGETS elements. `candidates` is the layer-0 search result, nearest first.
+    void rescueNewElement(
+        tableint cur_c,
+        const std::vector<tableint> &selectedNeighbors,
+        const std::vector<std::pair<dist_t, tableint>> &candidates) {
+        PruneDetourStats &stats = pruneDetourStats();
+        stats.rescue_needed.fetch_add(1, std::memory_order_relaxed);
+        std::vector<tableint> targets(selectedNeighbors.rbegin(), selectedNeighbors.rend());  // nearest first
+        for (const std::pair<dist_t, tableint> &candidate : candidates) {
+            if (std::find(selectedNeighbors.begin(), selectedNeighbors.end(), candidate.second) == selectedNeighbors.end())
+                targets.push_back(candidate.second);
+        }
+        size_t tried = 0;
+        for (tableint target : targets) {
+            if (tried == PRUNE_DETOUR_RESCUE_TARGETS)
+                break;
+            if (target == cur_c)
+                continue;
+            tried++;
+            std::unique_lock <std::mutex> lock = lockLinkListsForInsert(target);
+            linklistsizeint *ll = get_linklist0(target);
+            size_t count = getListCount(ll);
+            tableint *data = (tableint *) (ll + 1);
+            bool linked = std::find(data, data + count, cur_c) != data + count;
+            if (!linked && count < maxM0_) {
+                data[count] = cur_c;
+                publishListCount(ll, count + 1);
+                linked = true;
+            } else if (!linked) {
+                linked = pruneWithDetourCheck(target, cur_c, true);
+            }
+            if (linked) {
+                stats.rescue_linked.fetch_add(1, std::memory_order_relaxed);
+                return;
+            }
+        }
+        stats.rescue_failed.fetch_add(1, std::memory_order_relaxed);
     }
 
 
@@ -1328,6 +1666,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 
             bool epDeleted = isMarkedDeleted(enterpoint_copy);
             std::vector<std::pair<int, std::vector<tableint>>> selected_by_level;  // own-lists-first only
+            std::vector<std::pair<dist_t, tableint>> rescue_candidates;  // own-lists-first with detour check
             for (int level = std::min(curlevel, maxlevelcopy); level >= 0; level--) {
                 if (level > maxlevelcopy || level < 0)  // possible?
                     throw std::runtime_error("Level error");
@@ -1340,6 +1679,8 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
                         top_candidates.pop();
                 }
                 if (own_lists_first_) {
+                    if (detourCheckApplies(level, false))
+                        rescue_candidates = nearestFirst(top_candidates);
                     std::vector<tableint> selected = selectNewElementNeighbors(top_candidates);
                     currObj = selected.back();
                     writeNewElementList(cur_c, selected, level, false);
@@ -1349,7 +1690,9 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
                 }
             }
             for (const auto &level_selected : selected_by_level) {
-                linkBackToNewElement(cur_c, level_selected.second, level_selected.first, false);
+                size_t linked = linkBackToNewElement(cur_c, level_selected.second, level_selected.first, false);
+                if (detourCheckApplies(level_selected.first, false) && !linked)
+                    rescueNewElement(cur_c, level_selected.second, rescue_candidates);
             }
         } else {
             // Do nothing for the first element
