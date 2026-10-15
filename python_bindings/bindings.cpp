@@ -393,6 +393,12 @@ class TypedIndex {
     }
 
 
+    void set_ef_construction(size_t ef_construction) {
+        require_index("set_ef_construction");
+        appr_alg->setEfConstruction(ef_construction);
+    }
+
+
     void set_insert_concurrency(const std::string& mode) {
         if (mode != "locked" && mode != "relaxed") {
             throw std::invalid_argument("insert concurrency must be 'locked' or 'relaxed'");
@@ -1195,6 +1201,12 @@ class Index {
         return int8_index->set_num_threads(num_threads);
     }
 
+    void set_ef_construction(size_t ef_construction) {
+        if (float_index) return float_index->set_ef_construction(ef_construction);
+        if (uint8_index) return uint8_index->set_ef_construction(ef_construction);
+        return int8_index->set_ef_construction(ef_construction);
+    }
+
     void set_insert_concurrency(const std::string& mode) {
         if (float_index) return float_index->set_insert_concurrency(mode);
         if (uint8_index) return uint8_index->set_insert_concurrency(mode);
@@ -1623,6 +1635,10 @@ PYBIND11_PLUGIN(hnswlib) {
         .def("get_ids_list", &Index::getIdsList)
         .def("set_ef", &Index::set_ef, py::arg("ef"))
         .def("set_num_threads", &Index::set_num_threads, py::arg("num_threads"))
+        .def("set_ef_construction", &Index::set_ef_construction, py::arg("ef_construction"),
+             "Sets the search width of later inserts (at least M), for example on a loaded index, "
+             "which otherwise keeps the ef_construction it was built with. The ef_construction "
+             "property returns it.")
         .def("set_insert_concurrency", &Index::set_insert_concurrency, py::arg("mode"),
              "'locked' (default) or 'relaxed': relaxed inserts skip per-element link-list locks, so "
              "concurrent inserts may lose links. Set it after init_index/load_index (which, like "

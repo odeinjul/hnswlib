@@ -193,6 +193,13 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
     }
 
 
+    // Search width of later inserts (and updates); a loaded index keeps the value it was built
+    // with until this is called. Like the constructor, it is at least M.
+    void setEfConstruction(size_t ef_construction) {
+        ef_construction_ = std::max(ef_construction, M_);
+    }
+
+
     void setRelaxedInserts(bool relaxed) {
         relaxed_inserts_ = relaxed;
     }
