@@ -62,7 +62,7 @@ class PruneDetourCheckTestCase(unittest.TestCase):
         self.assertTrue(index.get_prune_detour_check())
         self.assertEqual(set(hnswlib.Index.get_prune_detour_stats()),
                          {'prunes', 'prunes_with_drops', 'dropped_old', 'verified', 'refilled', 'swapped',
-                          'left_unchanged', 'rescue_needed', 'rescue_linked', 'rescue_failed'})
+                          'left_unchanged', 'rescue_needed', 'rescue_linked', 'rescue_failed', 'witness_busy'})
 
     def testSetEfConstructionMatchesInitIndex(self):
         index = hnswlib.Index(space='l2', dim=16)

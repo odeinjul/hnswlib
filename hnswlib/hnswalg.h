@@ -29,11 +29,12 @@ struct PruneDetourStats {
     std::atomic<uint64_t> rescue_needed{0};      // inserts left without any layer-0 back-link
     std::atomic<uint64_t> rescue_linked{0};      // ... then linked into a searched element
     std::atomic<uint64_t> rescue_failed{0};      // ... that stayed without one
+    std::atomic<uint64_t> witness_busy{0};       // witness lists skipped: their lock was held
 
     void reset() {
         for (std::atomic<uint64_t> *counter : {&prunes, &prunes_with_drops, &dropped_old, &verified,
                                                &refilled, &swapped, &left_unchanged, &rescue_needed,
-                                               &rescue_linked, &rescue_failed}) {
+                                               &rescue_linked, &rescue_failed, &witness_busy}) {
             counter->store(0);
         }
     }
@@ -814,12 +815,13 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
     // With `rescue`, cur_c must be kept: it is placed before any unverified drop, is never swapped
     // out, and the back-link counters are not updated. Returns whether u's list holds cur_c.
     //
-    // The lists of other elements are read without their locks, and an entry still counts as a
-    // witness when its list changes right after the read: every id read from s's list was an
-    // edge s -> z at some time, and with the check on (locked inserts) every later removal of
-    // s -> z is itself verified, so a path s ~> z, and with it u ~> z, remains. Not covered are
-    // concurrent prunes that verify the same entry through each other (u drops z because s holds
-    // it while s drops z because u holds it), and relaxed inserts, which overwrite lists unchecked.
+    // With locked inserts, the list of another element s is read under s's lock, taken with
+    // try_lock: the caller holds u's lock and its own new element's lock, so waiting could
+    // deadlock. A list whose lock is busy counts as unknown (it cannot witness), which only makes
+    // the prune more conservative. A list can still change right after it is read, so two
+    // concurrent prunes can verify the same entry through each other (u drops z because s holds
+    // it while s drops z because u holds it): the check is best effort, not a guarantee. Relaxed
+    // inserts take no locks, read lists unlocked and overwrite them unchecked.
     bool pruneWithDetourCheck(tableint u, tableint cur_c, bool rescue) {
         const size_t Mcurmax = maxM0_;
         linklistsizeint *ll_u = get_linklist0(u);
@@ -883,10 +885,20 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         // 2. member[i * n + j]: the layer-0 list of entry j holds entry i. Lists are read lazily.
         std::vector<char> member(n * n, 0);
         std::vector<char> list_read(n, 0);
+        size_t witness_busy = 0;
         auto read_list = [&](size_t j) {
             if (list_read[j])
                 return;
             list_read[j] = 1;
+            // This insert already holds the locks of cur_c and u.
+            std::unique_lock<std::mutex> lock;
+            if (j != cur && ids[j] != u && !relaxed_inserts_) {
+                lock = std::unique_lock<std::mutex>(link_list_locks_[ids[j]], std::try_to_lock);
+                if (!lock.owns_lock()) {
+                    witness_busy++;
+                    return;
+                }
+            }
             linklistsizeint *ll = get_linklist0(ids[j]);
             size_t count = std::min((size_t) getListCount(ll), maxM0_);
             const tableint *links = (const tableint *) (ll + 1);
@@ -995,6 +1007,8 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
             publishListCount(ll_u, order.size());
         }
 
+        if (witness_busy)
+            pruneDetourStats().witness_busy.fetch_add(witness_busy, std::memory_order_relaxed);
         if (!rescue) {
             PruneDetourStats &stats = pruneDetourStats();
             stats.prunes.fetch_add(1, std::memory_order_relaxed);

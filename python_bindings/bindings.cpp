@@ -1267,7 +1267,8 @@ class Index {
             "left_unchanged"_a = stats.left_unchanged.load(),
             "rescue_needed"_a = stats.rescue_needed.load(),
             "rescue_linked"_a = stats.rescue_linked.load(),
-            "rescue_failed"_a = stats.rescue_failed.load());
+            "rescue_failed"_a = stats.rescue_failed.load(),
+            "witness_busy"_a = stats.witness_busy.load());
     }
 
     static void reset_prune_detour_stats() {
@@ -1707,7 +1708,7 @@ PYBIND11_PLUGIN(hnswlib) {
         .def_static("get_prune_detour_stats", &Index::get_prune_detour_stats,
              "Counters of the detour-checked prune, shared by all indexes of the process: prunes, "
              "prunes_with_drops, dropped_old, verified, refilled, swapped, left_unchanged, "
-             "rescue_needed, rescue_linked, rescue_failed.")
+             "rescue_needed, rescue_linked, rescue_failed, witness_busy.")
         .def_static("reset_prune_detour_stats", &Index::reset_prune_detour_stats,
              "Sets the process-wide detour-check counters to zero.")
         .def("index_file_size", &Index::indexFileSize)
